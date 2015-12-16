@@ -5,8 +5,11 @@
 import Foundation
 import Shared
 import Storage
+import XCGLogger
 
 private let log = Logger.syncLogger
+
+// MARK: - External synchronizer interface.
 
 public class BufferingBookmarksSynchronizer: TimestampedSingleCollectionSynchronizer, Synchronizer {
     public required init(scratchpad: Scratchpad, delegate: SyncDelegate, basePrefs: Prefs) {
@@ -17,7 +20,7 @@ public class BufferingBookmarksSynchronizer: TimestampedSingleCollectionSynchron
         return BookmarksStorageVersion
     }
 
-    public func mirrorBookmarksToStorage(storage: BookmarkBufferStorage, withServer storageClient: Sync15StorageClient, info: InfoCollections, greenLight: () -> Bool) -> SyncResult {
+    public func synchronizeBookmarksToStorage(storage: SyncableBookmarks, usingBuffer buffer: BookmarkBufferStorage, withServer storageClient: Sync15StorageClient, info: InfoCollections, greenLight: () -> Bool) -> SyncResult {
         if let reason = self.reasonToNotSync(storageClient) {
             return deferMaybe(.NotStarted(reason))
         }
@@ -29,10 +32,102 @@ public class BufferingBookmarksSynchronizer: TimestampedSingleCollectionSynchron
             return deferMaybe(FatalError(message: "Couldn't make bookmarks factory."))
         }
 
-        let mirrorer = BookmarksMirrorer(storage: storage, client: bookmarksClient, basePrefs: self.prefs, collection: "bookmarks")
-        return mirrorer.go(info, greenLight: greenLight) >>> always(SyncStatus.Completed)
+        let mirrorer = BookmarksMirrorer(storage: buffer, client: bookmarksClient, basePrefs: self.prefs, collection: "bookmarks")
+        let applier = MergeApplier(buffer: buffer, storage: storage, client: bookmarksClient, greenLight: greenLight)
+
+        // TODO: if the mirrorer tells us we're incomplete, then don't bother trying to sync!
+        // We will need to extend the BookmarksMirrorer interface to allow us to see what's
+        // going on.
+        return mirrorer.go(info, greenLight: greenLight)
+           >>> applier.go
     }
 }
+
+private class MergeApplier {
+    let greenLight: () -> Bool
+    let buffer: BookmarkBufferStorage
+    let storage: SyncableBookmarks
+    let client: Sync15CollectionClient<BookmarkBasePayload>
+    let merger: BookmarksMerger
+
+    init(buffer: BookmarkBufferStorage, storage: SyncableBookmarks, client: Sync15CollectionClient<BookmarkBasePayload>, greenLight: () -> Bool) {
+        self.greenLight = greenLight
+        self.buffer = buffer
+        self.storage = storage
+        self.merger = NoOpBookmarksMerger(buffer: buffer, storage: storage)
+        self.client = client
+    }
+
+    func go() -> SyncResult {
+        if !self.greenLight() {
+            log.info("Green light turned red; not merging bookmarks.")
+            return deferMaybe(SyncStatus.Completed)
+        }
+
+        return self.merger.merge() >>== { result in
+            result.describe(log)
+            return result.uploadCompletion.applyToClient(self.client)
+              >>== { result.overrideCompletion.applyToStore(self.storage, withUpstreamResult: $0) }
+               >>> { result.bufferCompletion.applyToBuffer(self.buffer) }
+               >>> always(SyncStatus.Completed)
+        }
+
+    }
+}
+
+// MARK: - Self-description.
+
+protocol DescriptionDestination {
+    func write(message: String)
+}
+
+extension XCGLogger: DescriptionDestination {
+    func write(message: String) {
+        self.info(message)
+    }
+}
+
+// MARK: - Protocols to define merge results.
+
+protocol UpstreamCompletionOp {
+    func describe(log: DescriptionDestination)
+
+    // TODO: this should probably return a timestamp.
+    // The XIUS that we'll need for the upload can be captured as part of the op.
+    func applyToClient(client: Sync15CollectionClient<BookmarkBasePayload>) -> Deferred<Maybe<UploadResult>>
+}
+
+protocol LocalOverrideCompletionOp {
+    func describe(log: DescriptionDestination)
+    func applyToStore(storage: SyncableBookmarks, withUpstreamResult upstream: UploadResult) -> Success
+}
+
+protocol BufferCompletionOp {
+    func describe(log: DescriptionDestination)
+    func applyToBuffer(buffer: BookmarkBufferStorage) -> Success
+}
+
+struct BookmarksMergeResult {
+    let uploadCompletion: UpstreamCompletionOp
+    let overrideCompletion: LocalOverrideCompletionOp
+    let bufferCompletion: BufferCompletionOp
+
+    // If this is true, the merge was only partial, and you should try again immediately.
+    // This allows for us to make progress on individual subtrees, without having huge
+    // waterfall steps.
+    let again: Bool
+
+    func describe(log: DescriptionDestination) {
+        log.write("Merge result:")
+        self.uploadCompletion.describe(log)
+        self.overrideCompletion.describe(log)
+        self.bufferCompletion.describe(log)
+        log.write("Again? \(again)")
+    }
+
+    static let NoOp = BookmarksMergeResult(uploadCompletion: UpstreamCompletionNoOp(), overrideCompletion: LocalOverrideCompletionNoOp(), bufferCompletion: BufferCompletionNoOp(), again: false)
+}
+
 
 /**
  * The merger takes as input an existing storage state (mirror and local override),
@@ -51,11 +146,15 @@ public class BufferingBookmarksSynchronizer: TimestampedSingleCollectionSynchron
  * It is expected that the caller will immediately apply the result in this order:
  *
  * 1. Upload the remote changes, if any. If this fails we can retry the entire process.
- * 2. Apply the local changes, if any. If this fails we will re-download the records
- *    we just uploaded, and should reach the same end state.
- * 3. Switch to the new mirror state. If this fails, we should find that our reconciled
- *    server contents apply neatly to our mirror and empty local, and we'll reach the
- *    same end state.
+ * 2(a). Apply the local changes, if any. If this fails we will re-download the records
+ *       we just uploaded, and should reach the same end state.
+ *       This step takes a timestamp key from (1), because pushing a record into the mirror
+ *       requires a server timestamp.
+ * 2(b). Switch to the new mirror state. If this fails, we should find that our reconciled
+ *       server contents apply neatly to our mirror and empty local, and we'll reach the
+ *       same end state.
+ * 3. Apply buffer changes. We only do this after the mirror has advanced; if we fail to
+ *    clean up the buffer, it'll reconcile neatly with the mirror on a subsequent try.
  * 4. Update bookkeeping timestamps. If this fails we will download uploaded records,
  *    find they match, and have no repeat merging work to do.
  *
@@ -63,14 +162,408 @@ public class BufferingBookmarksSynchronizer: TimestampedSingleCollectionSynchron
  * updated the server), our local overlay is empty (because we reconciled conflicts and
  * applied our changes to the server), and the mirror matches the server.
  *
- * This implementation is coupled to SQLiteBookmarks out of convenience.
+ * Note that upstream application is robust: we can use XIUS to ensure that writes don't
+ * race. Buffer application is similarly robust, because this code owns all writes to the
+ * buffer. Local and mirror application, however, is not: the user's actions can cause
+ * changes to write to the database before we're done applying the results of a sync.
+ * We mitigate this a little by being explicit about the local changes that we're flushing
+ * (rather than, say, `DELETE FROM local`), but to do better we'd need change detection
+ * (e.g., an in-memory monotonic counter) or locking to prevent bookmark operations from
+ * racing. Later!
  */
-class SQLiteBookmarksMerger {
-    private let buffer: BookmarkBufferStorage
-    private let storage: SQLiteBookmarks
+protocol BookmarksMerger {
+    init(buffer: BookmarkBufferStorage, storage: SyncableBookmarks)
+    func merge() -> Deferred<Maybe<BookmarksMergeResult>>
+}
 
-    init(buffer: BookmarkBufferStorage, storage: SQLiteBookmarks) {
+// MARK: - No-op implementations of each protocol.
+
+typealias UploadResult = (succeeded: [GUID: Timestamp], failed: Set<GUID>)
+
+class NoOpBookmarksMerger: BookmarksMerger {
+    let buffer: BookmarkBufferStorage
+    let storage: SyncableBookmarks
+
+    required init(buffer: BookmarkBufferStorage, storage: SyncableBookmarks) {
         self.buffer = buffer
         self.storage = storage
+    }
+
+    func merge() -> Deferred<Maybe<BookmarksMergeResult>> {
+        return deferMaybe(BookmarksMergeResult.NoOp)
+    }
+}
+
+class UpstreamCompletionNoOp: UpstreamCompletionOp {
+    func describe(log: DescriptionDestination) {
+        log.write("No upstream operation.")
+    }
+
+    func applyToClient(client: Sync15CollectionClient<BookmarkBasePayload>) -> Deferred<Maybe<UploadResult>> {
+        return deferMaybe((succeeded: [:], failed: Set<GUID>()))
+    }
+}
+
+class LocalOverrideCompletionNoOp: LocalOverrideCompletionOp {
+    func describe(log: DescriptionDestination) {
+        log.write("No local override operation.")
+    }
+
+    func applyToStore(storage: SyncableBookmarks, withUpstreamResult upstream: UploadResult) -> Success {
+        return succeed()
+    }
+}
+
+class BufferCompletionNoOp: BufferCompletionOp {
+    func describe(log: DescriptionDestination) {
+        log.write("No buffer operation.")
+    }
+    func applyToBuffer(buffer: BookmarkBufferStorage) -> Success {
+        return succeed()
+    }
+}
+
+public class BookmarksMergeError: MaybeErrorType, ErrorType {
+    public var description: String {
+        return "Merge error"
+    }
+}
+
+public class BookmarksMergeConsistencyError: BookmarksMergeError {
+    override public var description: String {
+        return "Merge consistency error"
+    }
+}
+
+public class BookmarksMergeErrorTreeIsUnrooted: BookmarksMergeConsistencyError {
+    public let roots: Set<GUID>
+
+    public init(roots: Set<GUID>) {
+        self.roots = roots
+    }
+
+    override public var description: String {
+        return "Tree is unrooted: roots are \(self.roots)"
+    }
+}
+
+// MARK: - Real implementations of each protocol.
+
+class TrivialBookmarksMerger: BookmarksMerger {
+    let buffer: BookmarkBufferStorage
+    let storage: SyncableBookmarks
+
+    required init(buffer: BookmarkBufferStorage, storage: SyncableBookmarks) {
+        self.buffer = buffer
+        self.storage = storage
+    }
+
+    // Trivial one-way sync.
+    private func applyLocalDirectlyToMirror() -> Deferred<Maybe<BookmarksMergeResult>> {
+        // Theoretically, we do the following:
+        // * Construct a virtual bookmark tree overlaying local on the mirror.
+        // * Walk the tree to produce Sync records.
+        // * Upload those records.
+        // * Flatten that tree into the mirror, clearing local.
+        //
+        // This is simpler than a full three-way merge: it's tree delta then flatten.
+        //
+        // But we are confident that our local changes, when overlaid on the mirror, are
+        // consistent. So we can take a little bit of a shortcut: process records
+        // directly, rather than building a tree.
+        //
+        // So do the following:
+        // * Take everything in `local` and turn it into a Sync record. This means pulling
+        //   folder hierarchies out of localStructure, values out of local, and turning
+        //   them into records. Do so in hierarchical order if we can, and set sortindex
+        //   attributes to put folders first.
+        // * Upload those records in as many batches as necessary. Ensure that each batch
+        //   is consistent, if at all possible.
+        // * Take everything in local that was successfully uploaded and move it into the
+        //   mirror, using the timestamps we tracked from the upload.
+        //
+        // Optionally, set 'again' to true in our response, and do this work only for a
+        // particular subtree (e.g., a single root, or a single branch of changes). This
+        // allows us to make incremental progress.
+
+        // TODO
+        log.debug("No special-case local-only merging yet. Falling back to three-way merge.")
+        return self.threeWayMerge()
+    }
+
+    private func applyIncomingDirectlyToMirror() -> Deferred<Maybe<BookmarksMergeResult>> {
+        // If the incoming buffer is consistent -- and the result of the mirrorer
+        // gives us a hint about that! -- then we can move the buffer records into
+        // the mirror directly.
+        //
+        // Note that this is also true for entire subtrees: if none of the children
+        // of, say, 'menu________' are modified locally, then we can apply it without
+        // merging.
+        //
+        // TODO
+        log.debug("No special-case remote-only merging yet. Falling back to three-way merge.")
+        return self.threeWayMerge()
+    }
+
+    private func threeWayMerge() -> Deferred<Maybe<BookmarksMergeResult>> {
+        return self.storage.treesForEdges() >>== { (local, buffer) in
+            if local.isEmpty && buffer.isEmpty {
+                // We should never have been called!
+                return deferMaybe(BookmarksMergeResult.NoOp)
+            }
+
+            // Find the mirror tree so we can compare.
+            return self.storage.treeForMirror() >>== { mirror in
+                return self.threeWayMergeBetweenLocal(local, mirror: mirror, buffer: buffer)
+            }
+        }
+    }
+
+    private func threeWayMergeBetweenLocal(local: BookmarkTree, mirror: BookmarkTree, buffer: BookmarkTree) -> Deferred<Maybe<BookmarksMergeResult>> {
+        // At this point we know that there have been changes both locally and remotely.
+        // (Or, in the general case, changes either locally or remotely.)
+        //
+        // This function takes as input three 'trees'.
+        //
+        // The mirror is always complete, never contains deletions, never has
+        // orphans, and has a single root.
+        //
+        // Each of local and buffer can contain a number of subtrees (each of which must
+        // be a folder or root), a number of deleted GUIDs, and a number of orphans (records
+        // with no known parent).
+        //
+        // It's very likely that there's almost no overlap, and thus no real conflicts to
+        // resolve -- a three-way merge isn't always a bad thing -- but we won't know until
+        // we compare records.
+        //
+        // Even though this function is called `threeWayMerge`, it also handles the case
+        // of a two-way merge (one without a shared parent; for the roots, this will only
+        // be on a first sync): content-based and structural merging is needed at all
+        // layers of the hierarchy, so we simply generalize that to also apply to roots.
+        //
+        // In a sense, a two-way merge is solved by constructing a shared parent consisting of
+        // roots, which are implicitly shared.
+        // (Special care must be taken to not deduce that one side has deleted a root, of course,
+        // as would be the case of a Sync server that doesn't contain
+        // a Mobile Bookmarks folder -- the set of roots can only grow, not shrink.)
+        //
+        // To begin with we structurally reconcile. If necessary we will lazily fetch the
+        // attributes of records in order to do a content-based reconciliation. Once we've
+        // matched up any records that match (including remapping local GUIDs), we're able to
+        // process _content_ changes, which is much simpler.
+        //
+        // We have to handle an arbitrary combination of the following structural operations:
+        //
+        // * Creating a folder.
+        //   Created folders might now hold existing items, new items, or nothing at all.
+        // * Creating a bookmark.
+        //   It might be in a new folder or an existing folder.
+        // * Moving one or more leaf records to an existing or new folder.
+        // * Reordering the children of a folder.
+        // * Deleting an entire subtree.
+        // * Deleting an entire subtree apart from some moved nodes.
+        // * Deleting a leaf node.
+        // * Transplanting a subtree: moving a folder but not changing its children.
+        //
+        // And, of course, the non-structural operations such as renaming or changing URLs.
+        //
+        // We ignore all changes to roots themselves; the only acceptable operation on a root
+        // is to change its children. The Places root is entirely immutable.
+        //
+        // Steps:
+        // * Construct a collection of subtrees for local and buffer, and a complete tree for the mirror.
+        //   The more thorough this step, the more confidence we have in consistency.
+        // * Fetch all local and remote deletions. These won't be included in structure (for obvious
+        //   reasons); we hold on to them explicitly so we can spot the difference between a move
+        //   and a deletion.
+        // * If every GUID on each side is present in the mirror, we have no new records.
+        // * If a non-root GUID is present on both sides but not in the mirror, then either
+        //   we're re-syncing from scratch, or (unlikely) we have a random collision.
+        // * Otherwise, we have a GUID that we don't recognize. We will structure+content reconcile
+        //   this later -- we first make sure we have handled any tree moves, so that the addition
+        //   of a bookmark to a moved folder on A, and the addition of the same bookmark to the non-
+        //   moved version of the folder, will collide successfully.
+        //
+        // * Walk each subtree, top-down. At each point if there are two back-pointers to
+        //   the mirror node for a GUID, we have a potential conflict, and we have all three
+        //   parts that we need to resolve it via a content-based or structure-based 3WM.
+
+        // When we look at a child list:
+        // * It's the same. Great! Keep walking down.
+        // * There are added GUIDs.
+        //   * An added GUID might be a move from elsewhere. Coordinate with the removal step.
+        //   * An added GUID might be a brand new record. If there are local additions too,
+        //     check to see if they value-reconcile, and keep the remote GUID.
+        // * There are removed GUIDs.
+        //   * A removed GUID might have been deleted. Deletions win.
+        //   * A missing GUID might be a move -- removed from here and added to another folder.
+        //     Process this as a move.
+        // * The order has changed.
+
+        // When we get to a subtree that contains no changes, we can never hit conflicts, and
+        // application becomes easier.
+        // When we run out of subtrees on both sides, we're done.
+        //
+        // Match, no conflict? Apply.
+        // Match, conflict? Resolve. Might involve moves from other matches!
+        // No match in the mirror? Check for content match with the same parent, any position.
+        // Still no match? Add.
+
+        // Both local and buffer should reach a single root when overlayed. If not, it means that
+        // the tree is inconsistent -- there isn't a full tree present either on the server (or local)
+        // or in the mirror, or the changes aren't congruent in some way. If we reach this state, we
+        // cannot proceed.
+        if !local.isFullyRootedIn(mirror) {
+            log.warning("Local bookmarks not fully rooted when overlayed on mirror. This is most unusual.")
+            return deferMaybe(BookmarksMergeErrorTreeIsUnrooted(roots: local.subtreeGUIDs))
+        }
+
+        if !buffer.isFullyRootedIn(mirror) {
+            log.warning("Bookmarks buffer not fully rooted when overlayed on mirror. Partial read or write?")
+
+            // TODO: request recovery.
+            return deferMaybe(BookmarksMergeErrorTreeIsUnrooted(roots: buffer.subtreeGUIDs))
+        }
+
+        let mirrorAllGUIDs = Set<GUID>(mirror.lookup.keys)
+        let localAllGUIDs = Set<GUID>(local.lookup.keys)
+        let bufferAllGUIDs = Set<GUID>(buffer.lookup.keys)
+        let localAdditions = localAllGUIDs.subtract(mirrorAllGUIDs)
+        let bufferAdditions = bufferAllGUIDs.subtract(mirrorAllGUIDs)
+
+        log.debug("Processing \(localAllGUIDs.count) local changes and \(bufferAllGUIDs.count) remote.")
+        log.debug("\(local.subtrees.count) local subtrees and \(buffer.subtrees.count) subtrees.")
+        log.debug("Local is adding \(localAdditions.count) records, and remote is adding \(bufferAdditions.count).")
+
+        let allGUIDs = localAllGUIDs.union(bufferAllGUIDs)
+        let conflictingGUIDs = localAllGUIDs.intersect(bufferAllGUIDs)
+        if !conflictingGUIDs.isEmpty {
+            log.warning("Expecting conflicts between local and buffer: \(conflictingGUIDs.joinWithSeparator(", ")).")
+        }
+
+        // Keep track of records we've processed.
+        // TODO: track local and remote separately?
+        //var processed: Set<GUID> = Set<GUID>(minimumCapacity: allGUIDs.count)
+
+
+        func processBufferRoot(subtree: BookmarkTreeNode, withMirrored mirrored: BookmarkTreeNode?, localCounterpart counterpart: BookmarkTreeNode?) throws {
+            // Roots are great; we know that the top can't have been moved.
+
+            func takeRemote() {
+                // There are no local changes… but the remote record's children might include
+                // records that have been moved locally!
+            }
+
+            func resolveConflictWithLocalChildren(localChildren: [BookmarkTreeNode]) {
+                // N.B., the record might itself have changed, not just its children!
+
+            }
+
+            // Routine case: we have a shared mirror.
+            if let mirrored = mirrored {
+                if let counterpart = counterpart {
+                    switch counterpart {
+                    case .Unknown:
+                        log.debug("Local record is Unknown, implying no local change. Taking remote.")
+                        takeRemote()
+                    case let .Folder(_, children):
+                        // We have a local record that matches.
+                        log.debug("Local, mirror, and remote entries for record \(subtree.recordGUID). Resolving conflict.")
+                        resolveConflictWithLocalChildren(children)
+                    case .NonFolder:
+                        // This implies a horrific local bug, or a GUID collision.
+                        // A GUID collision is a 1-in-255^9 chance, so let's scream and run away.
+                        log.debug("Local record is not a folder, but remote record is! For a root this is very surprising.")
+                        throw BookmarksMergeConsistencyError()
+                    }
+                } else {
+                    // No local change to this record.
+                    log.debug("Only remote and mirror entry for record \(subtree.recordGUID). Taking remote.")
+                    takeRemote()
+                }
+            } else {
+                if let counterpart = counterpart {
+                    // We have a local record that matches.
+                    log.debug("Both local and remote entries for record \(subtree.recordGUID), but no mirror. Doing raw merge.")
+                } else {
+                    // No local change to this record.
+                    log.debug("Only remote entry for record \(subtree.recordGUID). Taking it.")
+
+                }
+            }
+        }
+
+        func processBufferNonRoot(subtree: BookmarkTreeNode, withMirrored mirrored: BookmarkTreeNode?, localCounterpart counterpart: BookmarkTreeNode?) throws {
+        }
+
+        func processBufferSubtree(subtree: BookmarkTreeNode) throws {
+            // Subtree roots can never be Unknown, so this must be a folder or a non-folder.
+            let isFolder: Bool
+            switch subtree {
+            case .Folder:
+                isFolder = true
+            case .NonFolder:
+                isFolder = false
+            default:
+                log.error("Inconsistency: buffer record \(subtree.recordGUID) is not a folder! Skipping.")
+                throw BookmarksMergeConsistencyError()
+            }
+
+            let isRoot = subtree.isRoot
+            log.debug("Buffer subtree \(subtree.recordGUID) \(isRoot ? "is" : "is not") a root.")
+
+            if isRoot && !isFolder {
+                log.error("Inconsistency: roots must be known to be folders. Uh oh.")
+                throw BookmarksMergeConsistencyError()
+            }
+
+            // The isFullyRootedIn check earlier would have failed if this could fail for non-roots.
+            let mirrored = mirror.find(subtree)
+            let counterpart = local.find(subtree)
+
+            if isRoot {
+                try processBufferRoot(subtree, withMirrored: mirrored, localCounterpart: counterpart)
+            } else {
+                try processBufferNonRoot(subtree, withMirrored: mirrored, localCounterpart: counterpart)
+            }
+        }
+
+        // Process incoming subtrees first.
+        do {
+            try buffer.subtrees.forEach(processBufferSubtree)
+        } catch {
+            return deferMaybe(error as? MaybeErrorType ?? BookmarksMergeError())
+        }
+
+        // TODO
+        local.subtrees.forEach { subtree in
+        }
+
+        return deferMaybe(BookmarksMergeResult.NoOp)
+    }
+
+    func merge() -> Deferred<Maybe<BookmarksMergeResult>> {
+        return self.buffer.isEmpty() >>== { noIncoming in
+
+            // TODO: the presence of empty desktop roots in local storage
+            // isn't something we really need to worry about. Can we skip it here?
+
+            return self.storage.isUnchanged() >>== { noOutgoing in
+                switch (noIncoming, noOutgoing) {
+                case (true, true):
+                    // Nothing to do!
+                    return deferMaybe(BookmarksMergeResult.NoOp)
+                case (true, false):
+                    // No incoming records to apply. Unilaterally apply local changes.
+                    return self.applyLocalDirectlyToMirror()
+                case (false, true):
+                    // No outgoing changes. Unilaterally apply remote changes if they're consistent.
+                    return self.buffer.validate() >>> self.applyIncomingDirectlyToMirror
+                default:
+                    // Changes on both sides. Merge.
+                    return self.buffer.validate() >>> self.threeWayMerge
+                }
+            }
+        }
     }
 }
