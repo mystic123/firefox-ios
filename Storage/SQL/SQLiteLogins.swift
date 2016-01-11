@@ -133,9 +133,17 @@ public class SQLiteLogins: BrowserLogins {
         let credential = NSURLCredential(user: row["username"] as? String ?? "",
             password: row["password"] as! String,
             persistence: NSURLCredentialPersistence.None)
-        let protectionSpace = NSURLProtectionSpace(host: row["hostname"] as! String,
+
+        // To correctly map the database entry of a hostname to what the Login struct expects we
+        // break down the hostname into scheme/protocol and host parts in order to satisfy NSURLProtectionSpace.
+        // In a way 'hostname' is a misnomer but for legacy reasons this can't be changed.
+        let hostnameURL = (row["hostname"] as? String)?.asURL
+        let host = hostnameURL?.host ?? ""
+        let `protocol` = hostnameURL?.scheme ?? ""
+
+        let protectionSpace = NSURLProtectionSpace(host: host,
             port: 0,
-            `protocol`: nil,
+            `protocol`: `protocol`,
             realm: row["httpRealm"] as? String,
             authenticationMethod: nil)
 
@@ -234,7 +242,9 @@ public class SQLiteLogins: BrowserLogins {
         "\(TableLoginsMirror) WHERE is_overridden = 0 AND hostname IS ? " +
         "ORDER BY timeLastUsed DESC"
 
-        let args: Args = [protectionSpace.host, protectionSpace.host]
+        // Since we store hostnames as the full scheme/protocol + host, combine the two to look up in our DB.
+        let hostname = "\(protectionSpace.`protocol`!)://\(protectionSpace.host)"
+        let args: Args = [hostname, hostname]
         if Logger.logPII {
             log.debug("Looking for login: \(protectionSpace.host)")
         }

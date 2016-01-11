@@ -123,7 +123,15 @@ public class Login: CustomStringConvertible, LoginData, LoginUsageData, Equatabl
     public let credentials: NSURLCredential
     public let protectionSpace: NSURLProtectionSpace
 
-    public var hostname: String { return protectionSpace.host }
+    public var hostname: String {
+        var hostnameString = ""
+        if let `protocol` = protectionSpace.`protocol` {
+            hostnameString += "\(`protocol`)://"
+        }
+        hostnameString += protectionSpace.host
+        return hostnameString
+    }
+
     public var username: String? { return credentials.user }
     public var password: String { return credentials.password! }
     public var usernameField: String? = nil
@@ -189,7 +197,13 @@ public class Login: CustomStringConvertible, LoginData, LoginUsageData, Equatabl
     public init(guid: String, hostname: String, username: String, password: String) {
         self.guid = guid
         self.credentials = NSURLCredential(user: username, password: password, persistence: NSURLCredentialPersistence.None)
-        self.protectionSpace = NSURLProtectionSpace(host: hostname, port: 0, `protocol`: nil, realm: nil, authenticationMethod: nil)
+
+        // Break down the full url hostname into its scheme/protocol and host components
+        let hostnameURL = hostname.asURL
+        let host = hostnameURL?.host ?? ""
+        let `protocol` = hostnameURL?.scheme ?? ""
+
+        self.protectionSpace = NSURLProtectionSpace(host: host, port: 0, `protocol`: `protocol`, realm: nil, authenticationMethod: nil)
     }
 
     convenience init(hostname: String, username: String, password: String) {
