@@ -146,15 +146,25 @@ struct BookmarksMergeResult {
  * It is expected that the caller will immediately apply the result in this order:
  *
  * 1. Upload the remote changes, if any. If this fails we can retry the entire process.
+ *
  * 2(a). Apply the local changes, if any. If this fails we will re-download the records
  *       we just uploaded, and should reach the same end state.
  *       This step takes a timestamp key from (1), because pushing a record into the mirror
  *       requires a server timestamp.
+ *
  * 2(b). Switch to the new mirror state. If this fails, we should find that our reconciled
  *       server contents apply neatly to our mirror and empty local, and we'll reach the
  *       same end state.
+ *       Mirror state is applied in a sane order to respect relational constraints:
+ *
+ *       - Add any new records in the value table.
+ *       - Change any existing records in the value table.
+ *       - Update structure.
+ *       - Remove records from the value table.
+ *
  * 3. Apply buffer changes. We only do this after the mirror has advanced; if we fail to
  *    clean up the buffer, it'll reconcile neatly with the mirror on a subsequent try.
+ *
  * 4. Update bookkeeping timestamps. If this fails we will download uploaded records,
  *    find they match, and have no repeat merging work to do.
  *
@@ -293,7 +303,7 @@ class ThreeWayTreeMerger {
     // the trees, to avoid re-processing complementary nodes, and of
     // course to flatten a recursive tree walk into iteration.
     var conflictValueQueue: [GUID] = []
-    var remoteValueQueue: [BookmarkTreeNode] = []     // Need value reconciling.
+    var remoteValueQueue: [GUID] = []                 // Need value reconciling.
     var remoteQueue: [BookmarkTreeNode] = []          // Structure to walk.
 
     init(local: BookmarkTree, mirror: BookmarkTree, remote: BookmarkTree) {
@@ -311,122 +321,164 @@ class ThreeWayTreeMerger {
     }
 
     func processRemoteNode(node: BookmarkTreeNode) throws {
-        // Find the mirror node from which we descend, and find any corresponding local change.
-        // Search by GUID only, because (a) the mirror is a GUID match by definition, and (b)
-        // we only do content-based matches for nodes where we categorically know their parent
-        // folder, and when the node is new (i.e., no mirror match), so we do it when processing a folder.
-        let mirrored = mirror.find(node)
-        let counterpart = local.find(node)
-
-        // Apologies for the hellacious nested switches. Swift doesn't allow functions to
-        // constrain arguments to, say, BookmarkTreeNode.Folders, so breaking this apart is
-        // not easy.
         switch node {
-
         case let .Folder(guid, remoteChildren):
             // Folder: children changed and/or the folder's value changed.
-            if let mirrored = mirrored {
-                // This is a change from a known mirror node.
-                guard case let .Folder(_, originalChildren) = mirrored else {
-                    // It's not a folder! Uh oh!
-                    log.error("Unable to process change of \(guid) from non-folder to folder.")
-                    throw BookmarksMergeConsistencyError()
-                }
-
-                if let counterpart = counterpart {
-                    // Also locally changed. Resolve the conflict.
-                    guard case let .Folder(_, localChildren) = counterpart else {
-                        log.error("Local record \(guid) changed the type of a mirror node!")
-                        throw BookmarksMergeConsistencyError()
-                    }
-
-                    let remoteChildGUIDs = remoteChildren.map { $0.recordGUID }
-                    let originalChildGUIDs = originalChildren.map { $0.recordGUID }
-                    let localChildGUIDs = localChildren.map { $0.recordGUID }
-
-                    let remoteUnchanged = (remoteChildGUIDs == originalChildGUIDs)
-                    let localUnchanged = (localChildGUIDs == originalChildGUIDs)
-
-                    if remoteUnchanged {
-                        if localUnchanged {
-                            // Neither side changed structure, so this must be a value-only change on both sides.
-                            log.debug("Value-only local-remote conflict for \(guid).")
-                            conflictValueQueue.append(guid)
-                        } else {
-                            // This folder changed locally.
-                            log.debug("Remote folder didn't change structure, but collides with a local structural change.")
-                            log.debug("Local child list changed children. Was: \(originalChildGUIDs). Now: \(localChildGUIDs).")
-
-                            // Track the folder to check for value changes.
-                            remoteValueQueue.append(node)
-
-                            // TODO: for each child, check whether it's an addition, removal, rearrangement, or move.
-                            // Look in other trees to check for the other part of these operations.
-                            // Mark those nodes as done so we don't process moves etc. more than once.
-                        }
-                    } else {
-                        // Remote changed structure.
-
-                        // Track the folder to check for value changes.
-                        remoteValueQueue.append(node)
-
-                        if localUnchanged {
-                            log.debug("Remote folder changed structure for \(guid).")
-                            // TODO: take it.
-                        } else {
-                            log.debug("Structural conflict for \(guid).")
-                            // TODO: reconcile.
-                        }
-                    }
-                    // TODO
-                } else {
-                    // Not locally changed. But the children might have been modified or deleted, so
-                    // we can't unilaterally apply the incoming record.
-                    // Make sure that the records in our child list still exist, and that our child
-                    // list doesn't create orphans.
-                    // Also track this folder to check for value changes.
-                    remoteValueQueue.append(node)
-
-                    let remoteChildGUIDs = remoteChildren.map { $0.recordGUID }
-                    let originalChildGUIDs = originalChildren.map { $0.recordGUID }
-                    if remoteChildGUIDs == originalChildGUIDs {
-                        // Great, the child list didn't change. Must've just changed this folder's values.
-                        log.debug("Remote child list hasn't changed from the mirror.")
-                    } else {
-                        log.debug("Remote child list changed children. Was: \(originalChildGUIDs). Now: \(remoteChildGUIDs).")
-                        // TODO: for each child, check whether it's an addition, removal, rearrangement, or move.
-                        // Look in other trees to check for the other part of these operations.
-                        // Mark those nodes as done so we don't process moves etc. more than once.
-                    }
-
-                    // Now recursively process the children.
-                    remoteChildren.forEach { child in
-                        switch child {
-                        case .Folder:
-                            // Depth-first.
-                            log.debug("Queueing child \(child.recordGUID) for structural and value changes.")
-                            remoteQueue.append(child)
-                            remoteValueQueue.append(child)
-                        case .NonFolder:
-                            log.debug("Queueing child \(child.recordGUID) for value-only change.")
-                            remoteValueQueue.append(child)
-                        case .Unknown:
-                            log.debug("Child \(child.recordGUID) didn't change.")
-                        }
-                    }
-                }
-            } else {
-                // No mirror node. It must be a remote addition.
-                // TODO
-            }
-        case .NonFolder:
+            try self.processRemoteFolderWithGUID(guid, children: remoteChildren)
+        case let .NonFolder(guid):
             // Value change or parent change.
-            remoteValueQueue.append(node)
+            remoteValueQueue.append(guid)
         case .Unknown:
             // Placeholder. Nothing to do: it hasn't changed.
             // We should never get here.
             log.warning("Structurally processing an Unknown buffer node. We should never get here!")
             break
+        }
+    }
+
+    func processRemoteFolderWithGUID(guid: GUID, children: [BookmarkTreeNode]) throws {
+        // Find the mirror node from which we descend, and find any corresponding local change.
+        // Search by GUID only, because (a) the mirror is a GUID match by definition, and (b)
+        // we only do content-based matches for nodes where we categorically know their parent
+        // folder, and when the node is new (i.e., no mirror match), so we do it when processing a folder.
+        if let mirrored = self.mirror.find(guid) {
+            // This is a change from a known mirror node.
+            guard case let .Folder(_, originalChildren) = mirrored else {
+                // It's not a folder! Uh oh!
+                log.error("Unable to process change of \(guid) from non-folder to folder.")
+                throw BookmarksMergeConsistencyError()
+            }
+            try self.processKnownRemoteFolderWithGUID(guid, children: children, originalChildren: originalChildren)
+        } else {
+            // No mirror node. It must be a remote addition.
+            try self.processPotentiallyNewRemoteFolderWithGUID(guid, children: children)
+        }
+    }
+
+    func processPotentiallyNewRemoteFolderWithGUID(guid: GUID, children: [BookmarkTreeNode]) throws {
+        // Check for a local counterpart. If none exists, create this folder. If one does exist,
+        // do a two-way merge.
+        // Doing this work involves value-processing the incoming record, and all of its
+        // children, before doing the structure insert. So it's a good job we queue up
+        // all of these work items and run the insertion value changes first, isn't it?
+        //
+        // Note that it's theoretically possible for two remote folders to match against a
+        // local folder -- e.g., add two child folders named "AAA" to a folder that locally
+        // already contains "AAA". We must ensure that one or none of the remote records
+        // matches, not both.
+    }
+
+
+    func enqueueRemoteChildrenForProcessing(children: [BookmarkTreeNode]) {
+        // Recursively enqueue the children for processing.
+        children.forEach { child in
+            switch child {
+            case let .Folder(childGUID, _):
+                // Depth-first.
+                log.debug("Queueing child \(childGUID) for structural and value changes.")
+                remoteQueue.append(child)
+                remoteValueQueue.append(childGUID)
+            case let .NonFolder(childGUID):
+                log.debug("Queueing child \(childGUID) for value-only change.")
+                remoteValueQueue.append(childGUID)
+            case let .Unknown(childGUID):
+                log.debug("Child \(childGUID) didn't change. Descending no further.")
+            }
+        }
+    }
+
+    func processKnownChangedRemoteFolderWithGUID(guid: GUID, children: [BookmarkTreeNode], originalChildren: [BookmarkTreeNode]) throws {
+            // TODO: for each child, check whether it's an addition, removal, rearrangement, or move.
+            // Look in other trees to check for the other part of these operations.
+            // Mark those nodes as done so we don't process moves etc. more than once.
+    }
+
+    // Only call this if you know the lists differ.
+    func processKnownChangedLocalFolderWithGUID(guid: GUID, originalChildren: [BookmarkTreeNode], localChildren: [BookmarkTreeNode]) throws {
+
+    }
+
+    /**
+     * This handles the case when we're processing an incoming folder that supersedes
+     * an existing mirror folder.
+     */
+    func processKnownRemoteFolderWithGUID(guid: GUID, children: [BookmarkTreeNode], originalChildren: [BookmarkTreeNode]) throws {
+        if let counterpart = self.local.find(guid) {
+            // Also locally changed. Resolve the conflict.
+            guard case let .Folder(_, localChildren) = counterpart else {
+                log.error("Local record \(guid) changed the type of a mirror node!")
+                throw BookmarksMergeConsistencyError()
+            }
+            try self.processPotentiallyConflictingKnownRemoteFolderWithGUID(guid, remoteChildren: children, originalChildren: originalChildren, localChildren: localChildren)
+            return
+        }
+
+        // Not locally changed. But the children might have been modified or deleted, so
+        // we can't unilaterally apply the incoming record.
+        // Make sure that the records in our child list still exist, and that our child
+        // list doesn't create orphans.
+        // Also track this folder to check for value changes.
+        remoteValueQueue.append(guid)
+
+        self.enqueueRemoteChildrenForProcessing(children)
+
+        let remoteChildGUIDs = children.map { $0.recordGUID }
+        let originalChildGUIDs = originalChildren.map { $0.recordGUID }
+        if remoteChildGUIDs == originalChildGUIDs {
+            // Great, the child list didn't change. Must've just changed this folder's values.
+            log.debug("Remote child list hasn't changed from the mirror.")
+        } else {
+            log.debug("Remote child list changed children. Was: \(originalChildGUIDs). Now: \(remoteChildGUIDs).")
+            try self.processKnownChangedRemoteFolderWithGUID(guid, children: children, originalChildren: originalChildren)
+        }
+    }
+
+    func processKnownLocalFolderWithGUID(guid: GUID, originalChildren: [BookmarkTreeNode], localChildren: [BookmarkTreeNode]) throws {
+        // TODO
+    }
+
+    /**
+     * This handles the case where we have both local and remote folder entries that supersede
+     * a mirror folder.
+     */
+    func processPotentiallyConflictingKnownRemoteFolderWithGUID(guid: GUID, remoteChildren: [BookmarkTreeNode], originalChildren: [BookmarkTreeNode], localChildren: [BookmarkTreeNode]) throws {
+        let remoteChildGUIDs = remoteChildren.map { $0.recordGUID }
+        let originalChildGUIDs = originalChildren.map { $0.recordGUID }
+        let localChildGUIDs = localChildren.map { $0.recordGUID }
+
+        let remoteUnchanged = (remoteChildGUIDs == originalChildGUIDs)
+        let localUnchanged = (localChildGUIDs == originalChildGUIDs)
+
+        if remoteUnchanged {
+            if localUnchanged {
+                // Neither side changed structure, so this must be a value-only change on both sides.
+                log.debug("Value-only local-remote conflict for \(guid).")
+                conflictValueQueue.append(guid)
+            } else {
+                // This folder changed locally.
+                log.debug("Remote folder didn't change structure, but collides with a local structural change.")
+                log.debug("Local child list changed children. Was: \(originalChildGUIDs). Now: \(localChildGUIDs).")
+
+                // Track the folder to check for value changes.
+                remoteValueQueue.append(guid)
+
+                // TODO: for each child, check whether it's an addition, removal, rearrangement, or move.
+                // Look in other trees to check for the other part of these operations.
+                // Mark those nodes as done so we don't process moves etc. more than once.
+            }
+        } else {
+            // Remote changed structure.
+
+            // Track the folder to check for value changes.
+            remoteValueQueue.append(guid)
+
+            if localUnchanged {
+                log.debug("Remote folder changed structure for \(guid).")
+                try self.processKnownChangedRemoteFolderWithGUID(guid, children: remoteChildren, originalChildren: originalChildren)
+            } else {
+                log.debug("Structural conflict for \(guid).")
+                // TODO: reconcile.
+            }
         }
     }
 
@@ -533,11 +585,7 @@ class ThreeWayTreeMerger {
         }
 
         do {
-            repeat {
-                if let item = self.remoteQueue.popLast() {
-                    try self.processRemoteNode(item)
-                }
-            } while !remoteQueue.isEmpty
+            repeat {} while try self.step()
         } catch {
             log.warning("Caught error \(error) while processing queue. \(self.remoteQueue.count) remaining items.")
             return deferMaybe(error as? MaybeErrorType ?? BookmarksMergeError())
@@ -547,6 +595,18 @@ class ThreeWayTreeMerger {
         // walking the buffer.
 
         return deferMaybe(BookmarksMergeResult.NoOp)
+    }
+
+    /**
+     * Returns true if work was done.
+     */
+    func step() throws -> Bool {
+        guard let item = self.remoteQueue.popLast() else {
+            log.debug("No more items.")
+            return false
+        }
+        try self.processRemoteNode(item)
+        return true
     }
 }
 
