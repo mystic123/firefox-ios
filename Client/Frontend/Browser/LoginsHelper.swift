@@ -93,6 +93,14 @@ class LoginsHelper: BrowserHelper {
         return profile.logins.getLoginsForProtectionSpace(protectionSpace)
     }
 
+    func updateLoginByGUID(guid: GUID, new: LoginData, significant: Bool) -> Success {
+        return profile.logins.updateLoginByGUID(guid, new: new, significant: significant)
+    }
+
+    func removeLoginsWithGUIDS(guids: [GUID]) -> Success {
+        return profile.logins.removeLoginsWithGUIDs(guids)
+    }
+
     func setCredentials(login: LoginData) {
         if login.password.isEmpty {
             log.debug("Empty password")

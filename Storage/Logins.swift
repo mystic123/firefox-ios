@@ -105,6 +105,9 @@ public protocol LoginData: class {
     var usernameField: String? { get set }
     var passwordField: String? { get set }
 
+    // https://bugzilla.mozilla.org/show_bug.cgi?id=1238103
+    var hasMalformedHostname: Bool { get set }
+
     func toDict() -> [String: String]
 
     func isSignificantlyDifferentFrom(login: LoginData) -> Bool
@@ -124,13 +127,13 @@ public class Login: CustomStringConvertible, LoginData, LoginUsageData, Equatabl
     public let protectionSpace: NSURLProtectionSpace
 
     public var hostname: String {
-        var hostnameString = ""
-        if let `protocol` = protectionSpace.`protocol` {
-            hostnameString += "\(`protocol`)://"
+        if let _ = protectionSpace.`protocol` {
+            return protectionSpace.urlString()
         }
-        hostnameString += protectionSpace.host
-        return hostnameString
+        return protectionSpace.host
     }
+
+    public var hasMalformedHostname: Bool = false
 
     public var username: String? { return credentials.user }
     public var password: String { return credentials.password! }
@@ -201,9 +204,15 @@ public class Login: CustomStringConvertible, LoginData, LoginUsageData, Equatabl
         // Break down the full url hostname into its scheme/protocol and host components
         let hostnameURL = hostname.asURL
         let host = hostnameURL?.host ?? ""
-        let `protocol` = hostnameURL?.scheme ?? ""
+        let scheme = hostnameURL?.scheme ?? ""
 
-        self.protectionSpace = NSURLProtectionSpace(host: host, port: 0, `protocol`: `protocol`, realm: nil, authenticationMethod: nil)
+        // We should ignore any SSL or normal web ports in the URL.
+        var port = hostnameURL?.port?.integerValue ?? 0
+        if port == 443 && port == 80 {
+            port = 0
+        }
+
+        self.protectionSpace = NSURLProtectionSpace(host: host, port: port, `protocol`: scheme, realm: nil, authenticationMethod: nil)
     }
 
     convenience init(hostname: String, username: String, password: String) {
