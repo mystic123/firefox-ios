@@ -39,35 +39,8 @@ class Authenticator {
 
         // Otherwise, try to look them up and show the prompt.
         if let loginsHelper = loginsHelper {
-            return loginsHelper.getLoginsForProtectionSpace(challenge.protectionSpace).bindQueue(dispatch_get_main_queue()) { res in
-
-                var credentials: NSURLCredential? = nil
-                if let logins = res.successValue?.asArray() {
-
-                    // It is possible that we might have duplicate entries since we match against host and scheme://host.
-                    // This is a side effect of https://bugzilla.mozilla.org/show_bug.cgi?id=1238103.
-                    if logins.count > 1 {
-                        credentials = findValidLoginAmongstLogins(logins, forProtectionSpace: challenge.protectionSpace)?.credentials
-                        removeMalformedLoginsFromLogins(logins, usingHelper: loginsHelper).upon { log.debug("Removed malformed logins. Success :\($0.isSuccess)") }
-                    }
-
-                    // Found a single entry but the schemes don't match. This is a result of a schemeless entry that we
-                    // saved in a previous iteration of the app so we need to migrate it. We only care about the
-                    // the username/password so we can rewrite the scheme to be correct.
-                    else if logins.count == 1 && logins[0].protectionSpace.`protocol` != challenge.protectionSpace.`protocol` {
-                        let login = logins[0]
-                        credentials = login.credentials
-                        let new = Login(credential: login.credentials, protectionSpace: challenge.protectionSpace)
-                        loginsHelper.updateLoginByGUID(login.guid, new: new, significant: true).value
-                    }
-
-                    // Found a single entry that matches the scheme and host - good to go.
-                    else {
-                        credentials = logins[0].credentials
-                    }
-                }
-
-                return self.promptForUsernamePassword(viewController, credentials: credentials, protectionSpace: challenge.protectionSpace, loginsHelper: loginsHelper)
+            return findMatchingCredentialsForChallenge(challenge, fromLoginsProvider: loginsHelper.logins).bindQueue(dispatch_get_main_queue()) { result in
+                return self.promptForUsernamePassword(viewController, credentials: result, protectionSpace: challenge.protectionSpace, loginsHelper: loginsHelper)
             }
         }
 
@@ -75,22 +48,50 @@ class Authenticator {
         return self.promptForUsernamePassword(viewController, credentials: nil, protectionSpace: challenge.protectionSpace, loginsHelper: nil)
     }
 
+    static func findMatchingCredentialsForChallenge(challenge: NSURLAuthenticationChallenge, fromLoginsProvider loginsProvider: BrowserLogins) -> Deferred<NSURLCredential?> {
+        let deferred = Deferred<NSURLCredential?>()
+        loginsProvider.getLoginsForProtectionSpace(challenge.protectionSpace).upon { res in
+            var credentials: NSURLCredential? = nil
+            if let logins = res.successValue?.asArray() {
+
+                // It is possible that we might have duplicate entries since we match against host and scheme://host.
+                // This is a side effect of https://bugzilla.mozilla.org/show_bug.cgi?id=1238103.
+                if logins.count > 1 {
+                    credentials = findValidLoginAmongstLogins(logins, forProtectionSpace: challenge.protectionSpace)?.credentials
+                    let malformedGUIDs: [GUID] = logins.flatMap { login in
+                        if login.hasMalformedHostname {
+                            return login.guid
+                        }
+                        return nil
+                    }
+                    loginsProvider.removeLoginsWithGUIDs(malformedGUIDs).upon { log.debug("Removed malformed logins. Success :\($0.isSuccess)") }
+                }
+
+                // Found a single entry but the schemes don't match. This is a result of a schemeless entry that we
+                // saved in a previous iteration of the app so we need to migrate it. We only care about the
+                // the username/password so we can rewrite the scheme to be correct.
+                else if logins.count == 1 && logins[0].protectionSpace.`protocol` != challenge.protectionSpace.`protocol` {
+                    let login = logins[0]
+                    credentials = login.credentials
+                    let new = Login(credential: login.credentials, protectionSpace: challenge.protectionSpace)
+                    loginsProvider.updateLoginByGUID(login.guid, new: new, significant: true).value
+                }
+
+                // Found a single entry that matches the scheme and host - good to go.
+                else {
+                    credentials = logins[0].credentials
+                }
+            }
+            deferred.fill(credentials)
+        }
+        return deferred
+    }
+
     private static func findValidLoginAmongstLogins(logins: [LoginData], forProtectionSpace protectionSpace: NSURLProtectionSpace) -> LoginData? {
         // A valid login is defined as one that matches the challenge protection space and is not malformed
         return logins.find { login in
             (login.protectionSpace.`protocol` == protectionSpace.`protocol`) && !(login.hasMalformedHostname ?? false)
         }
-    }
-
-    private static func removeMalformedLoginsFromLogins(logins: [LoginData], usingHelper loginsHelper: LoginsHelper) -> Success {
-        let malformedGUIDs: [GUID] = logins.flatMap { login in
-            if login.hasMalformedHostname {
-                return login.guid
-            }
-            return nil
-        }
-
-        return loginsHelper.removeLoginsWithGUIDS(malformedGUIDs)
     }
 
     private static func promptForUsernamePassword(viewController: UIViewController, credentials: NSURLCredential?, protectionSpace: NSURLProtectionSpace, loginsHelper: LoginsHelper?) -> Deferred<Maybe<LoginData>> {

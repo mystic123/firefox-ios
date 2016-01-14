@@ -19,6 +19,10 @@ class LoginsHelper: BrowserHelper {
     private let profile: Profile
     private var snackBar: SnackBar?
 
+    var logins: BrowserLogins {
+        return profile.logins
+    }
+
     class func name() -> String {
         return "LoginsHelper"
     }
