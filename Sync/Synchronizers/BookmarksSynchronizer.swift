@@ -221,9 +221,9 @@ protocol BookmarksStorageMerger {
     func merge() -> Deferred<Maybe<BookmarksMergeResult>>
 }
 
-// MARK: - No-op implementations of each protocol.
-
 typealias UploadResult = (succeeded: [GUID: Timestamp], failed: Set<GUID>)
+
+// MARK: - No-op implementations of each protocol.
 
 class NoOpBookmarksMerger: BookmarksStorageMerger {
     let buffer: BookmarkBufferStorage
@@ -280,6 +280,8 @@ class BufferCompletionNoOp: BufferCompletionOp {
         return succeed()
     }
 }
+
+// MARK: - Errors.
 
 public class BookmarksMergeError: MaybeErrorType, ErrorType {
     public var description: String {
