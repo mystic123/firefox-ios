@@ -89,7 +89,11 @@ extension XCGLogger: DescriptionDestination {
 
 // MARK: - Protocols to define merge results.
 
-protocol UpstreamCompletionOp {
+protocol PerhapsNoOp {
+    var isNoOp: Bool { get }
+}
+
+protocol UpstreamCompletionOp: PerhapsNoOp {
     func describe(log: DescriptionDestination)
 
     // TODO: this should probably return a timestamp.
@@ -97,17 +101,17 @@ protocol UpstreamCompletionOp {
     func applyToClient(client: Sync15CollectionClient<BookmarkBasePayload>) -> Deferred<Maybe<UploadResult>>
 }
 
-protocol LocalOverrideCompletionOp {
+protocol LocalOverrideCompletionOp: PerhapsNoOp {
     func describe(log: DescriptionDestination)
     func applyToStore(storage: SyncableBookmarks, withUpstreamResult upstream: UploadResult) -> Success
 }
 
-protocol BufferCompletionOp {
+protocol BufferCompletionOp: PerhapsNoOp {
     func describe(log: DescriptionDestination)
     func applyToBuffer(buffer: BookmarkBufferStorage) -> Success
 }
 
-struct BookmarksMergeResult {
+struct BookmarksMergeResult: PerhapsNoOp {
     let uploadCompletion: UpstreamCompletionOp
     let overrideCompletion: LocalOverrideCompletionOp
     let bufferCompletion: BufferCompletionOp
@@ -116,6 +120,13 @@ struct BookmarksMergeResult {
     // This allows for us to make progress on individual subtrees, without having huge
     // waterfall steps.
     let again: Bool
+
+    var isNoOp: Bool {
+        return self.uploadCompletion.isNoOp &&
+               self.overrideCompletion.isNoOp &&
+               self.bufferCompletion.isNoOp &&
+               !self.again
+    }
 
     func describe(log: DescriptionDestination) {
         log.write("Merge result:")
@@ -205,6 +216,10 @@ class NoOpBookmarksMerger: BookmarksStorageMerger {
 }
 
 class UpstreamCompletionNoOp: UpstreamCompletionOp {
+    var isNoOp: Bool {
+        return true
+    }
+
     func describe(log: DescriptionDestination) {
         log.write("No upstream operation.")
     }
@@ -215,6 +230,10 @@ class UpstreamCompletionNoOp: UpstreamCompletionOp {
 }
 
 class LocalOverrideCompletionNoOp: LocalOverrideCompletionOp {
+    var isNoOp: Bool {
+        return true
+    }
+
     func describe(log: DescriptionDestination) {
         log.write("No local override operation.")
     }
@@ -225,9 +244,14 @@ class LocalOverrideCompletionNoOp: LocalOverrideCompletionOp {
 }
 
 class BufferCompletionNoOp: BufferCompletionOp {
+    var isNoOp: Bool {
+        return true
+    }
+
     func describe(log: DescriptionDestination) {
         log.write("No buffer operation.")
     }
+
     func applyToBuffer(buffer: BookmarkBufferStorage) -> Success {
         return succeed()
     }
