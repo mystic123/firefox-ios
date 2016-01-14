@@ -8,6 +8,7 @@ import Storage
 
 private let CancelButtonTitle = NSLocalizedString("Cancel", comment: "Authentication prompt cancel button")
 private let LogInButtonTitle  = NSLocalizedString("Log in", comment: "Authentication prompt log in button")
+private let log = Logger.browserLogger
 
 class Authenticator {
     private static let MaxAuthenticationAttempts = 3
@@ -41,27 +42,28 @@ class Authenticator {
             return loginsHelper.getLoginsForProtectionSpace(challenge.protectionSpace).bindQueue(dispatch_get_main_queue()) { res in
 
                 var credentials: NSURLCredential? = nil
-                if let logins = res.successValue {
+                if let logins = res.successValue?.asArray() {
 
                     // It is possible that we might have duplicate entries since we match against host and scheme://host.
                     // This is a side effect of https://bugzilla.mozilla.org/show_bug.cgi?id=1238103.
                     if logins.count > 1 {
                         credentials = findValidLoginAmongstLogins(logins, forProtectionSpace: challenge.protectionSpace)?.credentials
-                        removeMalformedLoginsFromLogins(logins, usingHelper: loginsHelper)
+                        removeMalformedLoginsFromLogins(logins, usingHelper: loginsHelper).upon { log.debug("Removed malformed logins. Success :\($0.isSuccess)") }
                     }
 
                     // Found a single entry but the schemes don't match. This is a result of a schemeless entry that we
-                    // saved in a previous iteration of the app so we need to migrate it.
-                    else if let login = logins[0] where logins.count == 1 && logins[0]?.protectionSpace.`protocol` != challenge.protectionSpace.`protocol` {
+                    // saved in a previous iteration of the app so we need to migrate it. We only care about the
+                    // the username/password so we can rewrite the scheme to be correct.
+                    else if logins.count == 1 && logins[0].protectionSpace.`protocol` != challenge.protectionSpace.`protocol` {
+                        let login = logins[0]
                         credentials = login.credentials
-
                         let new = Login(credential: login.credentials, protectionSpace: challenge.protectionSpace)
-                        loginsHelper.updateLoginByGUID(login.guid, new: new, significant: true)
+                        loginsHelper.updateLoginByGUID(login.guid, new: new, significant: true).value
                     }
 
                     // Found a single entry that matches the scheme and host - good to go.
                     else {
-                        credentials = logins[0]?.credentials
+                        credentials = logins[0].credentials
                     }
                 }
 
@@ -73,21 +75,20 @@ class Authenticator {
         return self.promptForUsernamePassword(viewController, credentials: nil, protectionSpace: challenge.protectionSpace, loginsHelper: nil)
     }
 
-    private static func findValidLoginAmongstLogins(logins: Cursor<LoginData>, forProtectionSpace protectionSpace: NSURLProtectionSpace) -> LoginData? {
+    private static func findValidLoginAmongstLogins(logins: [LoginData], forProtectionSpace protectionSpace: NSURLProtectionSpace) -> LoginData? {
         // A valid login is defined as one that matches the challenge protection space and is not malformed
-        return logins.filter { login in
-            return (login?.protectionSpace.`protocol` == protectionSpace.`protocol`) && !(login?.hasMalformedHostname ?? false)
-        } .flatMap { $0 } .first
+        return logins.find { login in
+            (login.protectionSpace.`protocol` == protectionSpace.`protocol`) && !(login.hasMalformedHostname ?? false)
+        }
     }
 
-    private static func removeMalformedLoginsFromLogins(logins: Cursor<LoginData>, usingHelper loginsHelper: LoginsHelper) -> Success {
-        let malformedGUIDs: [GUID] = logins.map { login in
-            if let login = login where login.hasMalformedHostname {
+    private static func removeMalformedLoginsFromLogins(logins: [LoginData], usingHelper loginsHelper: LoginsHelper) -> Success {
+        let malformedGUIDs: [GUID] = logins.flatMap { login in
+            if login.hasMalformedHostname {
                 return login.guid
-            } else {
-                return nil
             }
-        } .flatMap { $0 }
+            return nil
+        }
 
         return loginsHelper.removeLoginsWithGUIDS(malformedGUIDs)
     }

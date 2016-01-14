@@ -135,7 +135,7 @@ public class SQLiteLogins: BrowserLogins {
             persistence: NSURLCredentialPersistence.None)
 
         // There was a bug in previous versions of the app where we saved only the hostname and not the
-        // scheme in the DB. To work with these scheme-less hostnames, we try to extract the scheme and
+        // scheme and port in the DB. To work with these scheme-less hostnames, we try to extract the scheme and
         // hostname by converting to a URL first. If there is no valid hostname or scheme for the URL,
         // fallback to returning the raw hostname value from the DB as the host and allow NSURLProtectionSpace
         // to use the default (http) scheme. See https://bugzilla.mozilla.org/show_bug.cgi?id=1238103.

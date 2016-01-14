@@ -208,7 +208,7 @@ public class Login: CustomStringConvertible, LoginData, LoginUsageData, Equatabl
 
         // We should ignore any SSL or normal web ports in the URL.
         var port = hostnameURL?.port?.integerValue ?? 0
-        if port == 443 && port == 80 {
+        if port == 443 || port == 80 {
             port = 0
         }
 
