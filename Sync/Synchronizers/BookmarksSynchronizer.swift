@@ -309,30 +309,58 @@ public class BookmarksMergeErrorTreeIsUnrooted: BookmarksMergeConsistencyError {
 
 // MARK: - Real implementations of each protocol.
 
-/** This class takes as input three 'trees'.
-  *
-  * The mirror is always complete, never contains deletions, never has
-  * orphans, and has a single root.
-  *
-  * Each of local and buffer can contain a number of subtrees (each of which must
-  * be a folder or root), a number of deleted GUIDs, and a number of orphans (records
-  * with no known parent).
-  *
-  * It's very likely that there's almost no overlap, and thus no real conflicts to
-  * resolve -- a three-way merge isn't always a bad thing -- but we won't know until
-  * we compare records.
-  *
-  * Even though this is called 'three way merge', it also handles the case
-  * of a two-way merge (one without a shared parent; for the roots, this will only
-  * be on a first sync): content-based and structural merging is needed at all
-  * layers of the hierarchy, so we simply generalize that to also apply to roots.
-  *
-  * In a sense, a two-way merge is solved by constructing a shared parent consisting of
-  * roots, which are implicitly shared.
-  * (Special care must be taken to not deduce that one side has deleted a root, of course,
-  * as would be the case of a Sync server that doesn't contain
-  * a Mobile Bookmarks folder -- the set of roots can only grow, not shrink.)
-  */
+class LocalOverrideCompletionStorageOp: LocalOverrideCompletionOp {
+    var processedLocalChanges: Set<GUID> = Set()         // These can be deleted when we're run.
+    var mirrorItemsToInsert: [BookmarkMirrorItem] = []   // These were locally or remotely added.
+    var mirrorItemsToUpdate: [BookmarkMirrorItem] = []   // These were already in the mirror, but changed.
+    var mirrorItemsToDelete: Set<GUID> = []              // These were locally or remotely deleted.
+    var mirrorStructures: [GUID: [GUID]] = [:]           // New or changed structure.
+
+    // TODO: PRAGMA defer_foreign_keys = ON; ? Or just delete structure before, add structure after?
+
+    var isNoOp: Bool {
+        return processedLocalChanges.isEmpty &&
+               mirrorItemsToDelete.isEmpty &&
+               mirrorItemsToInsert.isEmpty &&
+               mirrorItemsToUpdate.isEmpty &&
+               mirrorStructures.isEmpty
+    }
+
+    func describe(log: DescriptionDestination) {
+    }
+
+    func applyToStore(storage: SyncableBookmarks, withUpstreamResult upstream: UploadResult) -> Success {
+        // TODO: invert this relationship.
+        return succeed()
+    }
+
+}
+
+/**
+ * This class takes as input three 'trees'.
+ *
+ * The mirror is always complete, never contains deletions, never has
+ * orphans, and has a single root.
+ *
+ * Each of local and buffer can contain a number of subtrees (each of which must
+ * be a folder or root), a number of deleted GUIDs, and a number of orphans (records
+ * with no known parent).
+ *
+ * It's very likely that there's almost no overlap, and thus no real conflicts to
+ * resolve -- a three-way merge isn't always a bad thing -- but we won't know until
+ * we compare records.
+ *
+ * Even though this is called 'three way merge', it also handles the case
+ * of a two-way merge (one without a shared parent; for the roots, this will only
+ * be on a first sync): content-based and structural merging is needed at all
+ * layers of the hierarchy, so we simply generalize that to also apply to roots.
+ *
+ * In a sense, a two-way merge is solved by constructing a shared parent consisting of
+ * roots, which are implicitly shared.
+ * (Special care must be taken to not deduce that one side has deleted a root, of course,
+ * as would be the case of a Sync server that doesn't contain
+ * a Mobile Bookmarks folder -- the set of roots can only grow, not shrink.)
+ */
 class ThreeWayTreeMerger {
     let local: BookmarkTree
     let mirror: BookmarkTree
@@ -485,6 +513,9 @@ class ThreeWayTreeMerger {
 
     func processKnownLocalFolderWithGUID(guid: GUID, originalChildren: [BookmarkTreeNode], localChildren: [BookmarkTreeNode]) throws {
         // TODO
+                // TODO: for each child, check whether it's an addition, removal, rearrangement, or move.
+                // Look in other trees to check for the other part of these operations.
+                // Mark those nodes as done so we don't process moves etc. more than once.
     }
 
     /**
@@ -504,32 +535,37 @@ class ThreeWayTreeMerger {
                 // Neither side changed structure, so this must be a value-only change on both sides.
                 log.debug("Value-only local-remote conflict for \(guid).")
                 conflictValueQueue.append(guid)
-            } else {
-                // This folder changed locally.
-                log.debug("Remote folder didn't change structure, but collides with a local structural change.")
-                log.debug("Local child list changed children. Was: \(originalChildGUIDs). Now: \(localChildGUIDs).")
-
-                // Track the folder to check for value changes.
-                remoteValueQueue.append(guid)
-
-                // TODO: for each child, check whether it's an addition, removal, rearrangement, or move.
-                // Look in other trees to check for the other part of these operations.
-                // Mark those nodes as done so we don't process moves etc. more than once.
+                return
             }
-        } else {
-            // Remote changed structure.
+
+            // This folder changed locally.
+            log.debug("Remote folder didn't change structure, but collides with a local structural change.")
+            log.debug("Local child list changed children. Was: \(originalChildGUIDs). Now: \(localChildGUIDs).")
 
             // Track the folder to check for value changes.
             remoteValueQueue.append(guid)
 
-            if localUnchanged {
-                log.debug("Remote folder changed structure for \(guid).")
-                try self.processKnownChangedRemoteFolderWithGUID(guid, children: remoteChildren, originalChildren: originalChildren)
-            } else {
-                log.debug("Structural conflict for \(guid).")
-                // TODO: reconcile.
-            }
+            // Other than the potential value changes, this is structurally a local-only change.
+            // So process this just as we would if we were walking the local tree.
+            try self.processKnownLocalFolderWithGUID(guid, originalChildren: originalChildren, localChildren: localChildren)
+            return
         }
+
+        // Remote changed structure.
+
+        // Track the folder to check for value changes.
+        remoteValueQueue.append(guid)
+
+        if localUnchanged {
+            log.debug("Remote folder changed structure for \(guid).")
+            try self.processKnownChangedRemoteFolderWithGUID(guid, children: remoteChildren, originalChildren: originalChildren)
+            return
+        }
+
+        // There's definitely a conflict. Figure out a merge result using all three child lists.
+        log.debug("Structural conflict for \(guid).")
+
+        // TODO
     }
 
     func merge() -> Deferred<Maybe<BookmarksMergeResult>> {
