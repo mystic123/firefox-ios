@@ -24,9 +24,7 @@ class CollectionClientStorer: BookmarkStorer {
 
     func applyUpstreamCompletionOp(op: UpstreamCompletionOp) -> Deferred<Maybe<POSTResult>> {
         return self.client.post(op.records, ifUnmodifiedSince: op.ifUnmodifiedSince)
-          >>== { response in
-            return deferMaybe(response.value)
-        }
+          >>== { deferMaybe($0.value) }
     }
 }
 
@@ -39,16 +37,10 @@ struct BookmarksMergeResult: PerhapsNoOp {
     let overrideCompletion: LocalOverrideCompletionOp
     let bufferCompletion: BufferCompletionOp
 
-    // If this is true, the merge was only partial, and you should try again immediately.
-    // This allows for us to make progress on individual subtrees, without having huge
-    // waterfall steps.
-    let again: Bool
-
     var isNoOp: Bool {
         return self.uploadCompletion.isNoOp &&
                self.overrideCompletion.isNoOp &&
-               self.bufferCompletion.isNoOp &&
-               !self.again
+               self.bufferCompletion.isNoOp
     }
 
     func applyToClient(client: BookmarkStorer, storage: SyncableBookmarks, buffer: BookmarkBufferStorage) -> Success {
@@ -57,7 +49,7 @@ struct BookmarksMergeResult: PerhapsNoOp {
            >>> { buffer.applyBufferCompletionOp(self.bufferCompletion) }
     }
 
-    static let NoOp = BookmarksMergeResult(uploadCompletion: UpstreamCompletionOp(), overrideCompletion: LocalOverrideCompletionOp(), bufferCompletion: BufferCompletionOp(), again: false)
+    static let NoOp = BookmarksMergeResult(uploadCompletion: UpstreamCompletionOp(), overrideCompletion: LocalOverrideCompletionOp(), bufferCompletion: BufferCompletionOp())
 }
 
 
@@ -475,7 +467,10 @@ class ThreeWayTreeMerger {
         // TODO: process local subtrees, skipping nodes that were already picked up and processed while
         // walking the buffer.
 
-        return deferMaybe(BookmarksMergeResult(uploadCompletion: self.upstreamOp, overrideCompletion: self.localOp, bufferCompletion: self.bufferOp, again: false))
+        // TODO: process deletions and orphans for each side -- they won't necessarily have been
+        // present in the structure walks.
+
+        return deferMaybe(BookmarksMergeResult(uploadCompletion: self.upstreamOp, overrideCompletion: self.localOp, bufferCompletion: self.bufferOp))
     }
 
     /**
