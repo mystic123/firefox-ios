@@ -33,7 +33,8 @@ public class BufferingBookmarksSynchronizer: TimestampedSingleCollectionSynchron
         }
 
         let mirrorer = BookmarksMirrorer(storage: buffer, client: bookmarksClient, basePrefs: self.prefs, collection: "bookmarks")
-        let applier = MergeApplier(buffer: buffer, storage: storage, client: bookmarksClient, greenLight: greenLight)
+        let storer = CollectionClientStorer(client: bookmarksClient)
+        let applier = MergeApplier(buffer: buffer, storage: storage, client: storer, greenLight: greenLight)
 
         // TODO: if the mirrorer tells us we're incomplete, then don't bother trying to sync!
         // We will need to extend the BookmarksMirrorer interface to allow us to see what's
@@ -43,14 +44,33 @@ public class BufferingBookmarksSynchronizer: TimestampedSingleCollectionSynchron
     }
 }
 
-private class MergeApplier {
+// Because generic protocols in Swift are a pain in the ass.
+
+protocol BookmarkStorer {
+    func storeRecords(records: [Record<BookmarkBasePayload>], ifUnmodifiedSince: Timestamp?) -> Deferred<Maybe<StorageResponse<POSTResult>>>
+}
+
+class CollectionClientStorer: BookmarkStorer {
+    let client: Sync15CollectionClient<BookmarkBasePayload>
+
+    init(client: Sync15CollectionClient<BookmarkBasePayload>) {
+        self.client = client
+    }
+
+    func storeRecords(records: [Record<BookmarkBasePayload>], ifUnmodifiedSince: Timestamp?) -> Deferred<Maybe<StorageResponse<POSTResult>>> {
+        // TODO: do something useful with the response.
+        return self.client.post(records, ifUnmodifiedSince: ifUnmodifiedSince)
+    }
+}
+
+class MergeApplier {
     let greenLight: () -> Bool
     let buffer: BookmarkBufferStorage
     let storage: SyncableBookmarks
-    let client: Sync15CollectionClient<BookmarkBasePayload>
+    let client: BookmarkStorer
     let merger: BookmarksStorageMerger
 
-    init(buffer: BookmarkBufferStorage, storage: SyncableBookmarks, client: Sync15CollectionClient<BookmarkBasePayload>, greenLight: () -> Bool) {
+    init(buffer: BookmarkBufferStorage, storage: SyncableBookmarks, client: BookmarkStorer, greenLight: () -> Bool) {
         self.greenLight = greenLight
         self.buffer = buffer
         self.storage = storage
@@ -66,9 +86,7 @@ private class MergeApplier {
 
         return self.merger.merge() >>== { result in
             result.describe(log)
-            return result.uploadCompletion.applyToClient(self.client)
-              >>== { result.overrideCompletion.applyToStore(self.storage, withUpstreamResult: $0) }
-               >>> { result.bufferCompletion.applyToBuffer(self.buffer) }
+            return result.applyToClient(self.client, storage: self.storage, buffer: self.buffer)
                >>> always(SyncStatus.Completed)
         }
 
@@ -98,7 +116,7 @@ protocol UpstreamCompletionOp: PerhapsNoOp {
 
     // TODO: this should probably return a timestamp.
     // The XIUS that we'll need for the upload can be captured as part of the op.
-    func applyToClient(client: Sync15CollectionClient<BookmarkBasePayload>) -> Deferred<Maybe<UploadResult>>
+    func applyToClient(client: BookmarkStorer) -> Deferred<Maybe<UploadResult>>
 }
 
 protocol LocalOverrideCompletionOp: PerhapsNoOp {
@@ -126,6 +144,12 @@ struct BookmarksMergeResult: PerhapsNoOp {
                self.overrideCompletion.isNoOp &&
                self.bufferCompletion.isNoOp &&
                !self.again
+    }
+
+    func applyToClient(client: BookmarkStorer, storage: SyncableBookmarks, buffer: BookmarkBufferStorage) -> Success {
+        return self.uploadCompletion.applyToClient(client)
+          >>== { self.overrideCompletion.applyToStore(storage, withUpstreamResult: $0) }
+           >>> { self.bufferCompletion.applyToBuffer(buffer) }
     }
 
     func describe(log: DescriptionDestination) {
@@ -224,7 +248,7 @@ class UpstreamCompletionNoOp: UpstreamCompletionOp {
         log.write("No upstream operation.")
     }
 
-    func applyToClient(client: Sync15CollectionClient<BookmarkBasePayload>) -> Deferred<Maybe<UploadResult>> {
+    func applyToClient(client: BookmarkStorer) -> Deferred<Maybe<UploadResult>> {
         return deferMaybe((succeeded: [:], failed: Set<GUID>()))
     }
 }
