@@ -12,7 +12,7 @@ private let log = Logger.syncLogger
 // Because generic protocols in Swift are a pain in the ass.
 protocol BookmarkStorer {
     // TODO: this should probably return a timestamp.
-    func applyUpstreamCompletionOp(op: UpstreamCompletionOp) -> Deferred<Maybe<StorageResponse<POSTResult>>>
+    func applyUpstreamCompletionOp(op: UpstreamCompletionOp) -> Deferred<Maybe<POSTResult>>
 }
 
 class CollectionClientStorer: BookmarkStorer {
@@ -22,9 +22,11 @@ class CollectionClientStorer: BookmarkStorer {
         self.client = client
     }
 
-    func applyUpstreamCompletionOp(op: UpstreamCompletionOp) -> Deferred<Maybe<StorageResponse<POSTResult>>> {
-        // TODO: do something useful with the response.
+    func applyUpstreamCompletionOp(op: UpstreamCompletionOp) -> Deferred<Maybe<POSTResult>> {
         return self.client.post(op.records, ifUnmodifiedSince: op.ifUnmodifiedSince)
+          >>== { response in
+            return deferMaybe(response.value)
+        }
     }
 }
 
@@ -50,16 +52,14 @@ struct BookmarksMergeResult: PerhapsNoOp {
     }
 
     func applyToClient(client: BookmarkStorer, storage: SyncableBookmarks, buffer: BookmarkBufferStorage) -> Success {
-        return self.uploadCompletion.applyToClient(client)
-          >>== { self.storage.applyLocalOverrideCompletionOp(self.overrideCompletion, withUpstreamResult: $0) }
-           >>> { self.buffer.applyBufferCompletionOp(self.bufferCompletion) }
+        return client.applyUpstreamCompletionOp(self.uploadCompletion)
+          >>== { storage.applyLocalOverrideCompletionOp(self.overrideCompletion, withUpstreamResult: $0) }
+           >>> { buffer.applyBufferCompletionOp(self.bufferCompletion) }
     }
 
-    static let NoOp = BookmarksMergeResult(uploadCompletion: UpstreamCompletionNoOp(), overrideCompletion: LocalOverrideCompletionNoOp(), bufferCompletion: BufferCompletionNoOp(), again: false)
+    static let NoOp = BookmarksMergeResult(uploadCompletion: UpstreamCompletionOp(), overrideCompletion: LocalOverrideCompletionOp(), bufferCompletion: BufferCompletionOp(), again: false)
 }
 
-
-typealias UploadResult = (succeeded: [GUID: Timestamp], failed: Set<GUID>)
 
 class UpstreamCompletionOp: PerhapsNoOp {
     var records: [Record<BookmarkBasePayload>] = []
@@ -69,7 +69,7 @@ class UpstreamCompletionOp: PerhapsNoOp {
         return records.isEmpty
     }
 
-    init(ifUnmodifiedSince: Timestamp?) {
+    init(ifUnmodifiedSince: Timestamp?=nil) {
         self.ifUnmodifiedSince = ifUnmodifiedSince
     }
 }
@@ -475,7 +475,7 @@ class ThreeWayTreeMerger {
         // TODO: process local subtrees, skipping nodes that were already picked up and processed while
         // walking the buffer.
 
-        return deferMaybe(BookmarksMergeResult(uploadCompletion: self.upstreamOp, overrideCompletion: self.localOp, bufferCompletion: self.bufferOp, again: false)
+        return deferMaybe(BookmarksMergeResult(uploadCompletion: self.upstreamOp, overrideCompletion: self.localOp, bufferCompletion: self.bufferOp, again: false))
     }
 
     /**

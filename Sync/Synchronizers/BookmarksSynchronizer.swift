@@ -151,7 +151,7 @@ extension BookmarkBufferStorage {
 }
 
 extension SyncableBookmarks {
-    func applyLocalOverrideCompletionOp(op: LocalOverrideCompletionOp, withUpstreamResult upstream: UploadResult) -> Success {
+    func applyLocalOverrideCompletionOp(op: LocalOverrideCompletionOp, withUpstreamResult upstream: POSTResult) -> Success {
         return succeed()
     }
 }
