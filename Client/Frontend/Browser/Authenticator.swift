@@ -57,7 +57,10 @@ class Authenticator {
                 // It is possible that we might have duplicate entries since we match against host and scheme://host.
                 // This is a side effect of https://bugzilla.mozilla.org/show_bug.cgi?id=1238103.
                 if logins.count > 1 {
-                    credentials = findValidLoginAmongstLogins(logins, forProtectionSpace: challenge.protectionSpace)?.credentials
+                    credentials = (logins.find { login in
+                        (login.protectionSpace.`protocol` == challenge.protectionSpace.`protocol`) && !(login.hasMalformedHostname ?? false)
+                    })?.credentials
+
                     let malformedGUIDs: [GUID] = logins.flatMap { login in
                         if login.hasMalformedHostname {
                             return login.guid
@@ -85,13 +88,6 @@ class Authenticator {
             deferred.fill(credentials)
         }
         return deferred
-    }
-
-    private static func findValidLoginAmongstLogins(logins: [LoginData], forProtectionSpace protectionSpace: NSURLProtectionSpace) -> LoginData? {
-        // A valid login is defined as one that matches the challenge protection space and is not malformed
-        return logins.find { login in
-            (login.protectionSpace.`protocol` == protectionSpace.`protocol`) && !(login.hasMalformedHostname ?? false)
-        }
     }
 
     private static func promptForUsernamePassword(viewController: UIViewController, credentials: NSURLCredential?, protectionSpace: NSURLProtectionSpace, loginsHelper: LoginsHelper?) -> Deferred<Maybe<LoginData>> {
