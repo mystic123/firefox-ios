@@ -203,7 +203,7 @@ public class Login: CustomStringConvertible, LoginData, LoginUsageData, Equatabl
 
         // Break down the full url hostname into its scheme/protocol and host components
         let hostnameURL = hostname.asURL
-        let host = hostnameURL?.host ?? ""
+        let host = hostnameURL?.host ?? hostname
         let scheme = hostnameURL?.scheme ?? ""
 
         // We should ignore any SSL or normal web ports in the URL.
