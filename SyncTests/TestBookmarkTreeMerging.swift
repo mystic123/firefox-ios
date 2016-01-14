@@ -17,6 +17,15 @@ extension Dictionary {
     }
 }
 
+class MockUploader: BookmarkStorer {
+    func storeRecords(records: [Record<BookmarkBasePayload>], ifUnmodifiedSince: Timestamp?) -> Deferred<Maybe<StorageResponse<POSTResult>>> {
+        let guids = records.map { $0.id }
+        let responseMetadata = ResponseMetadata(status: 200, headers: [:])
+        let postResult = POSTResult(modified: NSDate.now(), success: guids, failed: [:])
+        return deferMaybe(StorageResponse<POSTResult>(value: postResult, metadata: responseMetadata))
+    }
+}
+
 // Thieved mercilessly from TestSQLiteBookmarks.
 private func getBrowserDB(filename: String, files: FileAccessor) -> BrowserDB? {
     let db = BrowserDB(filename: filename, files: files)
@@ -32,6 +41,15 @@ private func getBrowserDB(filename: String, files: FileAccessor) -> BrowserDB? {
 class TestBookmarkTreeMerging: XCTestCase {
     let filename = "TBookmarkTreeMerging.db"
     let files = MockFiles()
+
+    func getSyncableBookmarks() -> MergedSQLiteBookmarks? {
+        guard let db = getBrowserDB(self.filename, files: self.files) else {
+            XCTFail("Couldn't get prepared DB.")
+            return nil
+        }
+
+        return MergedSQLiteBookmarks(db: db)
+    }
 
     func getSQLiteBookmarks() -> SQLiteBookmarks? {
         guard let db = getBrowserDB(self.filename, files: self.files) else {
@@ -104,5 +122,36 @@ class TestBookmarkTreeMerging: XCTestCase {
 
         // TODO: enable this when basic merging is implemented.
         // XCTAssertFalse(result.isNoOp)
+    }
+
+    func testMergingStorageLocalRootsEmptyServer() {
+        guard let bookmarks = self.getSyncableBookmarks() else {
+            XCTFail("Couldn't get bookmarks.")
+            return
+        }
+
+        XCTAssertTrue(bookmarks.treeForMirror().value.successValue!.isEmpty)
+        let edgesBefore = bookmarks.treesForEdges().value.successValue!
+        XCTAssertFalse(edgesBefore.local.isEmpty)
+        XCTAssertTrue(edgesBefore.buffer.isEmpty)
+
+        let storer = MockUploader()
+
+        let applier = MergeApplier(buffer: bookmarks, storage: bookmarks, client: storer, greenLight: { true })
+        XCTAssertTrue(applier.go().value.isSuccess)
+
+        // Now the local contents are replicated into the mirror, and both the buffer and local are empty.
+        guard let mirror = bookmarks.treeForMirror().value.successValue else {
+            XCTFail("Couldn't get mirror!")
+            return
+        }
+
+        // TODO: stuff has moved to the mirror.
+        /*
+        XCTAssertTrue(mirror.subtrees[0].recordGUID == BookmarkRoots.RootGUID)
+        let edgesAfter = bookmarks.treesForEdges().value.successValue!
+        XCTAssertTrue(edgesAfter.local.isEmpty)
+        XCTAssertTrue(edgesAfter.buffer.isEmpty)
+*/
     }
 }
