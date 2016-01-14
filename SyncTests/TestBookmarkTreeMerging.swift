@@ -17,7 +17,40 @@ extension Dictionary {
     }
 }
 
+// Thieved mercilessly from TestSQLiteBookmarks.
+private func getBrowserDB(filename: String, files: FileAccessor) -> BrowserDB? {
+    let db = BrowserDB(filename: filename, files: files)
+
+    // BrowserTable exists only to perform create/update etc. operations -- it's not
+    // a queryable thing that needs to stick around.
+    if !db.createOrUpdate(BrowserTable()) {
+        return nil
+    }
+    return db
+}
+
 class TestBookmarkTreeMerging: XCTestCase {
+    let filename = "TBookmarkTreeMerging.db"
+    let files = MockFiles()
+
+    func getSQLiteBookmarks() -> SQLiteBookmarks? {
+        guard let db = getBrowserDB(self.filename, files: self.files) else {
+            XCTFail("Couldn't get prepared DB.")
+            return nil
+        }
+
+        return SQLiteBookmarks(db: db)
+    }
+
+    func dbLocalTree() -> BookmarkTree? {
+        guard let bookmarks = self.getSQLiteBookmarks() else {
+            XCTFail("Couldn't get bookmarks.")
+            return nil
+        }
+
+        return bookmarks.treeForLocal().value.successValue
+    }
+
     func localTree() -> BookmarkTree {
         let roots = BookmarkRoots.RootChildren.map { BookmarkTreeNode.Folder(guid: $0, children: []) }
         let places = BookmarkTreeNode.Folder(guid: BookmarkRoots.RootGUID, children: roots)
@@ -34,6 +67,15 @@ class TestBookmarkTreeMerging: XCTestCase {
         return BookmarkTree(subtrees: [places], lookup: lookup, parents: parents, orphans: Set(), deleted: Set())
     }
 
+    // Our synthesized tree is the same as the one we pull out of a brand new local DB.
+    func testLocalTreeAssumption() {
+        let constructed = self.localTree()
+        let fromDB = self.dbLocalTree()
+        XCTAssertNotNil(fromDB)
+        XCTAssertTrue(fromDB!.isFullyRootedIn(constructed))
+        XCTAssertTrue(constructed.isFullyRootedIn(fromDB!))
+    }
+
     // This scenario can never happen in the wild: we'll always have roots.
     func testMergingEmpty() {
         let r = BookmarkTree.emptyTree()
@@ -45,7 +87,8 @@ class TestBookmarkTreeMerging: XCTestCase {
             XCTFail("Couldn't merge.")
             return
         }
-        //XCTAssertEqual(result, BookmarksMergeResult.NoOp)
+
+        XCTAssertTrue(result.isNoOp)
     }
 
     func testMergingOnlyLocalRoots() {
@@ -58,6 +101,8 @@ class TestBookmarkTreeMerging: XCTestCase {
             XCTFail("Couldn't merge.")
             return
         }
-        //XCTAssertEqual(result, BookmarksMergeResult.NoOp) // NOT EVENTUALLY
+
+        // TODO: enable this when basic merging is implemented.
+        // XCTAssertFalse(result.isNoOp)
     }
 }
