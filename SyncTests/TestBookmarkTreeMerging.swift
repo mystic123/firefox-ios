@@ -18,11 +18,10 @@ extension Dictionary {
 }
 
 class MockUploader: BookmarkStorer {
-    func storeRecords(records: [Record<BookmarkBasePayload>], ifUnmodifiedSince: Timestamp?) -> Deferred<Maybe<StorageResponse<POSTResult>>> {
-        let guids = records.map { $0.id }
-        let responseMetadata = ResponseMetadata(status: 200, headers: [:])
+    func applyUpstreamCompletionOp(op: UpstreamCompletionOp) -> Deferred<Maybe<POSTResult>> {
+        let guids = op.records.map { $0.id }
         let postResult = POSTResult(modified: NSDate.now(), success: guids, failed: [:])
-        return deferMaybe(StorageResponse<POSTResult>(value: postResult, metadata: responseMetadata))
+        return deferMaybe(postResult)
     }
 }
 
