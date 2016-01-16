@@ -121,23 +121,27 @@ class BoolSetting: Setting {
     private let prefs: Prefs
     private let defaultValue: Bool
     private let settingDidChange: ((Bool) -> Void)?
-    private let statusText: String?
+    private let statusText: NSAttributedString?
 
-    init(prefs: Prefs, prefKey: String, defaultValue: Bool, titleText: String, statusText: String? = nil, settingDidChange: ((Bool) -> Void)? = nil) {
+    init(prefs: Prefs, prefKey: String, defaultValue: Bool, attributedTitleText: NSAttributedString, attributedStatusText: NSAttributedString? = nil, settingDidChange: ((Bool) -> Void)? = nil) {
         self.prefs = prefs
         self.prefKey = prefKey
         self.defaultValue = defaultValue
         self.settingDidChange = settingDidChange
-        self.statusText = statusText
-        super.init(title: NSAttributedString(string: titleText, attributes: [NSForegroundColorAttributeName: UIConstants.TableViewRowTextColor]))
+        self.statusText = attributedStatusText
+        super.init(title: attributedTitleText)
+    }
+
+    convenience init(prefs: Prefs, prefKey: String, defaultValue: Bool, titleText: String, statusText: String? = nil, settingDidChange: ((Bool) -> Void)? = nil) {
+        var statusTextAttributedString: NSAttributedString?
+        if let statusTextString = statusText {
+            statusTextAttributedString = NSAttributedString(string: statusTextString, attributes: [NSForegroundColorAttributeName: UIConstants.TableViewHeaderTextColor])
+        }
+        self.init(prefs: prefs, prefKey: prefKey, defaultValue: defaultValue, attributedTitleText: NSAttributedString(string: titleText, attributes: [NSForegroundColorAttributeName: UIConstants.TableViewRowTextColor]), attributedStatusText: statusTextAttributedString, settingDidChange: settingDidChange)
     }
 
     override var status: NSAttributedString? {
-        if let text = statusText {
-            return NSAttributedString(string: text, attributes: [NSForegroundColorAttributeName: UIConstants.TableViewHeaderTextColor])
-        } else {
-            return nil
-        }
+        return statusText
     }
 
     override func onConfigureCell(cell: UITableViewCell) {
@@ -604,6 +608,25 @@ private class SendFeedbackSetting: Setting {
     }
 }
 
+private class SendAnonymousUsageDataSetting: BoolSetting {
+    init(prefs: Prefs, delegate: SettingsDelegate?) {
+        super.init(
+            prefs: prefs, prefKey: "settings.sendUsageData", defaultValue: true,
+            attributedTitleText: NSAttributedString(string: NSLocalizedString("Send Anonymous Usage Data", tableName: "SendAnonymousUsageData", comment: "See http://bit.ly/1SmEXU1")),
+            attributedStatusText: NSAttributedString(string: NSLocalizedString("More Info…", tableName: "SendAnonymousUsageData", comment: "See http://bit.ly/1SmEXU1"), attributes: [NSForegroundColorAttributeName: UIColor.blueColor()]),
+            settingDidChange: { AdjustIntegration.setEnabled($0) }
+        )
+    }
+
+    override var url: NSURL? {
+        return SupportUtils.linkForTopic("adjust")
+    }
+
+    override func onClick(navigationController: UINavigationController?) {
+        setUpAndPushSettingsContentViewController(navigationController)
+    }
+}
+
 // Opens the the SUMO page in a new tab
 private class OpenSupportPageSetting: Setting {
     init(delegate: SettingsDelegate?) {
@@ -824,12 +847,12 @@ class SettingsTableViewController: UITableViewController {
             PrivacyPolicySetting()
         ]
 
-
         settings += [
             SettingSection(title: NSAttributedString(string: privacyTitle), children: privacySettings),
             SettingSection(title: NSAttributedString(string: NSLocalizedString("Support", comment: "Support section title")), children: [
                 ShowIntroductionSetting(settings: self),
                 SendFeedbackSetting(),
+                SendAnonymousUsageDataSetting(prefs: prefs, delegate: settingsDelegate),
                 OpenSupportPageSetting(delegate: settingsDelegate),
             ]),
             SettingSection(title: NSAttributedString(string: NSLocalizedString("About", comment: "About settings section title")), children: [
