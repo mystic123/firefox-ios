@@ -30,7 +30,11 @@ private struct AdjustSettings {
 /// functions in this object from other parts of the application.
 
 class AdjustIntegration: NSObject {
-    static let sharedInstance = AdjustIntegration()
+    let profile: Profile
+    
+    init(profile: Profile) {
+        self.profile = profile
+    }
 
     /// Return an ADJConfig object if Adjust has been enabled. It is determined from the values in
     /// the Info.plist file if Adjust should be enabled, and if so, what its application token and
@@ -96,6 +100,24 @@ class AdjustIntegration: NSObject {
         }
         return path
     }
+
+    /// Return true if Adjust should be enabled. If the user has disabled the Send Anonymous Usage Data then we immediately
+    /// return false. Otherwise we only do one ping, which means we only enable it if we have not seen the attributiond
+    /// data yet.
+    
+    private func shouldEnable() throws -> Bool {
+        if profile.prefs.boolForKey("settings.sendUsageData") ?? true {
+            return true
+        }
+        return try hasAttribution() == false
+    }
+    
+    /// Return true if retention (session) tracking should be enabled. This follows the Send Anonymous Usage Data
+    /// setting.
+    
+    private func shouldTrackRetention() -> Bool {
+        return profile.prefs.boolForKey("settings.sendUsageData") ?? true
+    }
 }
 
 extension AdjustIntegration: AdjustDelegate {
@@ -105,14 +127,15 @@ extension AdjustIntegration: AdjustDelegate {
 
     func triggerApplicationDidFinishLaunchingWithOptions(launchOptions: [NSObject : AnyObject]?) -> Void {
         do {
-            if try hasAttribution() == false {
+            if try shouldEnable() {
                 if let config = getConfig() {
+                    Logger.browserLogger.debug("ADJUST DEBUG - Adjust.appDidLoaunch()")
                     Adjust.appDidLaunch(config)
                 } else {
                     Logger.browserLogger.info("Adjust - Skipping because no or invalid config found")
                 }
             } else {
-                Logger.browserLogger.info("Adjust - Skipping because we have already seen attribution info for this install")
+                Logger.browserLogger.info("Adjust - Skipping because we have already seen attribution info for this install or sending of data is disabled")
             }
         } catch let error {
             Logger.browserLogger.error("Adjust - Failed to register application launch: \(error)")
@@ -129,10 +152,17 @@ extension AdjustIntegration: AdjustDelegate {
 
     func adjustAttributionChanged(attribution: ADJAttribution!) {
         do {
-            Adjust.setEnabled(false)
-            try AdjustIntegration.sharedInstance.saveAttribution(attribution)
+            Logger.browserLogger.debug("ADJUST DEBUG - Adjust.setEnabled(\(shouldTrackRetention()))")
+            Adjust.setEnabled(shouldTrackRetention())
+            Logger.browserLogger.debug("ADJUST DEBUG - Adjust.saveAttribution()")
+            try saveAttribution(attribution)
         } catch let error {
             Logger.browserLogger.error("Adjust - Failed to save attribution: \(error)")
         }
+    }
+    
+    static func setEnabled(enabled: Bool) {
+        Logger.browserLogger.debug("ADJUST DEBUG - Adjust.setEnabled(\(enabled))")
+        Adjust.setEnabled(enabled)
     }
 }
