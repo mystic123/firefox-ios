@@ -19,6 +19,7 @@ class LoginsHelper: BrowserHelper {
     private let profile: Profile
     private var snackBar: SnackBar?
 
+    // Exposed for mocking purposes
     var logins: BrowserLogins {
         return profile.logins
     }
