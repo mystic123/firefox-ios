@@ -116,7 +116,7 @@ class AuthenticatorTests: XCTestCase {
         let login = Login.createWithHostname("https://securesite.com", username: "username", password: "password")
         logins.addLogin(login).value
         let challenge = mockChallengeForURL(NSURL(string: "https://securesite.com")!, username: "username", password: "password")
-        let result = Authenticator.findMatchingCredentialsForChallenge(challenge, fromLoginsProvider: logins).value
+        let result = Authenticator.findMatchingCredentialsForChallenge(challenge, fromLoginsProvider: logins).value.successValue!
         XCTAssertNotNil(result)
         XCTAssertEqual(result?.user, "username")
         XCTAssertEqual(result?.password, "password")
@@ -132,7 +132,7 @@ class AuthenticatorTests: XCTestCase {
         XCTAssertEqual(oldHostname, "malformed.com")
 
         let challenge = mockChallengeForURL(NSURL(string: "https://malformed.com")!, username: "username", password: "password")
-        let result = Authenticator.findMatchingCredentialsForChallenge(challenge, fromLoginsProvider: logins).value
+        let result = Authenticator.findMatchingCredentialsForChallenge(challenge, fromLoginsProvider: logins).value.successValue!
         XCTAssertNotNil(result)
         XCTAssertEqual(result?.user, "username")
         XCTAssertEqual(result?.password, "password")
@@ -157,7 +157,7 @@ class AuthenticatorTests: XCTestCase {
         XCTAssertEqual(hostnames[1], "malformed.com")
 
         let challenge = mockChallengeForURL(NSURL(string: "https://malformed.com")!, username: "username", password: "password")
-        let result = Authenticator.findMatchingCredentialsForChallenge(challenge, fromLoginsProvider: logins).value
+        let result = Authenticator.findMatchingCredentialsForChallenge(challenge, fromLoginsProvider: logins).value.successValue!
         XCTAssertNotNil(result)
         XCTAssertEqual(result?.user, "good_username")
         XCTAssertEqual(result?.password, "good_password")

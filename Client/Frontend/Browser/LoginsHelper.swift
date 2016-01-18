@@ -101,7 +101,7 @@ class LoginsHelper: BrowserHelper {
         return profile.logins.updateLoginByGUID(guid, new: new, significant: significant)
     }
 
-    func removeLoginsWithGUIDS(guids: [GUID]) -> Success {
+    func removeLoginsWithGUIDs(guids: [GUID]) -> Success {
         return profile.logins.removeLoginsWithGUIDs(guids)
     }
 

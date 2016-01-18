@@ -40,7 +40,13 @@ class Authenticator {
         // Otherwise, try to look them up and show the prompt.
         if let loginsHelper = loginsHelper {
             return findMatchingCredentialsForChallenge(challenge, fromLoginsProvider: loginsHelper.logins).bindQueue(dispatch_get_main_queue()) { result in
-                return self.promptForUsernamePassword(viewController, credentials: result, protectionSpace: challenge.protectionSpace, loginsHelper: loginsHelper)
+                if let credentials = result.successValue {
+                    return self.promptForUsernamePassword(viewController, credentials: credentials, protectionSpace: challenge.protectionSpace, loginsHelper: loginsHelper)
+                } else if let credentialFailure = result.failureValue {
+                    return deferMaybe(credentialFailure)
+                } else {
+                    return deferMaybe(LoginDataError(description: "Unknown error when finding credentials"))
+                }
             }
         }
 
@@ -48,11 +54,13 @@ class Authenticator {
         return self.promptForUsernamePassword(viewController, credentials: nil, protectionSpace: challenge.protectionSpace, loginsHelper: nil)
     }
 
-    static func findMatchingCredentialsForChallenge(challenge: NSURLAuthenticationChallenge, fromLoginsProvider loginsProvider: BrowserLogins) -> Deferred<NSURLCredential?> {
-        let deferred = Deferred<NSURLCredential?>()
-        loginsProvider.getLoginsForProtectionSpace(challenge.protectionSpace).upon { res in
+    static func findMatchingCredentialsForChallenge(challenge: NSURLAuthenticationChallenge, fromLoginsProvider loginsProvider: BrowserLogins) -> Deferred<Maybe<NSURLCredential?>> {
+        return loginsProvider.getLoginsForProtectionSpace(challenge.protectionSpace).bind { res in
             var credentials: NSURLCredential? = nil
             if let logins = res.successValue?.asArray() {
+                guard logins.count >= 1 else {
+                    return deferMaybe(nil)
+                }
 
                 // It is possible that we might have duplicate entries since we match against host and scheme://host.
                 // This is a side effect of https://bugzilla.mozilla.org/show_bug.cgi?id=1238103.
@@ -84,10 +92,12 @@ class Authenticator {
                 else {
                     credentials = logins[0].credentials
                 }
+
+                return deferMaybe(credentials)
             }
-            deferred.fill(credentials)
+
+            return deferMaybe(LoginDataError(description: "Failed to retrieve login cursor"))
         }
-        return deferred
     }
 
     private static func promptForUsernamePassword(viewController: UIViewController, credentials: NSURLCredential?, protectionSpace: NSURLProtectionSpace, loginsHelper: LoginsHelper?) -> Deferred<Maybe<LoginData>> {
