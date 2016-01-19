@@ -8,6 +8,28 @@ import Shared
 @testable import Sync
 import XCTest
 
+
+// MARK: - The messy way to extend non-protocol generics.
+
+protocol Succeedable {
+    var isSuccess: Bool { get }
+}
+
+extension Maybe: Succeedable {
+}
+
+private extension Deferred where T: Succeedable {
+    func succeeded() {
+        self.value.isSuccess
+    }
+}
+
+private extension SQLiteBookmarkBufferStorage {
+    func queryReturnsInt(query: String, int: Int) {
+        XCTAssertEqual(int, self.db.runQuery(query, args: nil, factory: IntFactory).value.successValue![0])
+    }
+}
+
 extension Dictionary {
     init<S: SequenceType where S.Generator.Element == Element>(seq: S) {
         self.init()
@@ -18,7 +40,17 @@ extension Dictionary {
 }
 
 class MockUploader: BookmarkStorer {
+    var deletions: Set<GUID> = Set<GUID>()
+    var added: Set<GUID> = Set<GUID>()
+
     func applyUpstreamCompletionOp(op: UpstreamCompletionOp) -> Deferred<Maybe<POSTResult>> {
+        op.records.forEach { record in
+            if record.payload.deleted {
+                deletions.insert(record.id)
+            } else {
+                added.insert(record.id)
+            }
+        }
         let guids = op.records.map { $0.id }
         let postResult = POSTResult(modified: NSDate.now(), success: guids, failed: [:])
         return deferMaybe(postResult)
@@ -26,7 +58,7 @@ class MockUploader: BookmarkStorer {
 }
 
 // Thieved mercilessly from TestSQLiteBookmarks.
-private func getBrowserDB(filename: String, files: FileAccessor) -> BrowserDB? {
+private func getBrowserDBForFile(filename: String, files: FileAccessor) -> BrowserDB? {
     let db = BrowserDB(filename: filename, files: files)
 
     // BrowserTable exists only to perform create/update etc. operations -- it's not
@@ -38,11 +70,15 @@ private func getBrowserDB(filename: String, files: FileAccessor) -> BrowserDB? {
 }
 
 class TestBookmarkTreeMerging: XCTestCase {
-    let filename = "TBookmarkTreeMerging.db"
     let files = MockFiles()
 
-    func getSyncableBookmarks() -> MergedSQLiteBookmarks? {
-        guard let db = getBrowserDB(self.filename, files: self.files) else {
+    private func getBrowserDB(name: String) -> BrowserDB? {
+        let file = "TBookmarkTreeMerging\(name).db"
+        return getBrowserDBForFile(file, files: self.files)
+    }
+
+    func getSyncableBookmarks(name: String) -> MergedSQLiteBookmarks? {
+        guard let db = self.getBrowserDB(name) else {
             XCTFail("Couldn't get prepared DB.")
             return nil
         }
@@ -50,8 +86,8 @@ class TestBookmarkTreeMerging: XCTestCase {
         return MergedSQLiteBookmarks(db: db)
     }
 
-    func getSQLiteBookmarks() -> SQLiteBookmarks? {
-        guard let db = getBrowserDB(self.filename, files: self.files) else {
+    func getSQLiteBookmarks(name: String) -> SQLiteBookmarks? {
+        guard let db = self.getBrowserDB(name) else {
             XCTFail("Couldn't get prepared DB.")
             return nil
         }
@@ -59,8 +95,8 @@ class TestBookmarkTreeMerging: XCTestCase {
         return SQLiteBookmarks(db: db)
     }
 
-    func dbLocalTree() -> BookmarkTree? {
-        guard let bookmarks = self.getSQLiteBookmarks() else {
+    func dbLocalTree(name: String) -> BookmarkTree? {
+        guard let bookmarks = self.getSQLiteBookmarks(name) else {
             XCTFail("Couldn't get bookmarks.")
             return nil
         }
@@ -87,7 +123,7 @@ class TestBookmarkTreeMerging: XCTestCase {
     // Our synthesized tree is the same as the one we pull out of a brand new local DB.
     func testLocalTreeAssumption() {
         let constructed = self.localTree()
-        let fromDB = self.dbLocalTree()
+        let fromDB = self.dbLocalTree("A")
         XCTAssertNotNil(fromDB)
         XCTAssertTrue(fromDB!.isFullyRootedIn(constructed))
         XCTAssertTrue(constructed.isFullyRootedIn(fromDB!))
@@ -123,8 +159,15 @@ class TestBookmarkTreeMerging: XCTestCase {
         // XCTAssertFalse(result.isNoOp)
     }
 
+    private func doMerge(bookmarks: MergedSQLiteBookmarks) -> MockUploader {
+        let storer = MockUploader()
+        let applier = MergeApplier(buffer: bookmarks, storage: bookmarks, client: storer, greenLight: { true })
+        applier.go().succeeded()
+        return storer
+    }
+
     func testMergingStorageLocalRootsEmptyServer() {
-        guard let bookmarks = self.getSyncableBookmarks() else {
+        guard let bookmarks = self.getSyncableBookmarks("B") else {
             XCTFail("Couldn't get bookmarks.")
             return
         }
@@ -134,10 +177,7 @@ class TestBookmarkTreeMerging: XCTestCase {
         XCTAssertFalse(edgesBefore.local.isEmpty)
         XCTAssertTrue(edgesBefore.buffer.isEmpty)
 
-        let storer = MockUploader()
-
-        let applier = MergeApplier(buffer: bookmarks, storage: bookmarks, client: storer, greenLight: { true })
-        XCTAssertTrue(applier.go().value.isSuccess)
+        doMerge(bookmarks)
 
         // Now the local contents are replicated into the mirror, and both the buffer and local are empty.
         guard let mirror = bookmarks.treeForMirror().value.successValue else {
@@ -152,5 +192,121 @@ class TestBookmarkTreeMerging: XCTestCase {
         XCTAssertTrue(edgesAfter.local.isEmpty)
         XCTAssertTrue(edgesAfter.buffer.isEmpty)
 */
+    }
+
+    func testApplyingTwoEmptyFoldersDoesntSmush() {
+        guard let bookmarks = self.getSyncableBookmarks("C") else {
+            XCTFail("Couldn't get bookmarks.")
+            return
+        }
+
+        // Insert two identical folders. We mark them with hasDupe because that's the Syncy
+        // thing to do.
+        let now = NSDate.now()
+        let records = [
+            BookmarkMirrorItem.folder(BookmarkRoots.MobileFolderGUID, modified: now, hasDupe: false, parentID: BookmarkRoots.RootGUID, parentName: "", title: "Mobile Bookmarks", description: "", children: ["emptyempty01", "emptyempty02"]),
+            BookmarkMirrorItem.folder("emptyempty01", modified: now, hasDupe: true, parentID: BookmarkRoots.MobileFolderGUID, parentName: "Mobile Bookmarks", title: "Empty", description: "", children: []),
+            BookmarkMirrorItem.folder("emptyempty02", modified: now, hasDupe: true, parentID: BookmarkRoots.MobileFolderGUID, parentName: "Mobile Bookmarks", title: "Empty", description: "", children: []),
+        ]
+
+        bookmarks.buffer.applyRecords(records).succeeded()
+
+        bookmarks.buffer.queryReturnsInt("SELECT COUNT(*) FROM \(TableBookmarksBuffer)", int: 3)
+        bookmarks.buffer.queryReturnsInt("SELECT COUNT(*) FROM \(TableBookmarksBufferStructure)", int: 2)
+
+        doMerge(bookmarks)
+
+        guard let mirror = bookmarks.treeForMirror().value.successValue else {
+            XCTFail("Couldn't get mirror!")
+            return
+        }
+
+        // After merge, the buffer and local are empty.
+        let edgesAfter = bookmarks.treesForEdges().value.successValue!
+        XCTAssertTrue(edgesAfter.local.isEmpty)
+        XCTAssertTrue(edgesAfter.buffer.isEmpty)
+
+        // When merged in, we do not smush these two records together!
+        XCTAssertTrue(mirror.subtrees[0].recordGUID == BookmarkRoots.RootGUID)
+        XCTAssertNotNil(mirror.find("emptyempty01"))
+        XCTAssertNotNil(mirror.find("emptyempty02"))
+        XCTAssertTrue(mirror.deleted.isEmpty)
+        guard let mobile = mirror.find(BookmarkRoots.MobileFolderGUID) else {
+            XCTFail("No mobile folder in mirror.")
+            return
+        }
+
+        if case let .Folder(_, children) = mobile {
+            XCTAssertEqual(children.map { $0.recordGUID }, ["emptyempty01", "emptyempty02"])
+        } else {
+            XCTFail("Mobile isn't a folder.")
+        }
+    }
+
+    func testApplyingTwoEmptyFoldersMatchesOnlyOne() {
+        guard let bookmarks = self.getSyncableBookmarks("D") else {
+            XCTFail("Couldn't get bookmarks.")
+            return
+        }
+
+        // Insert three identical folders. We mark them with hasDupe because that's the Syncy
+        // thing to do.
+        let now = NSDate.now()
+        let records = [
+            BookmarkMirrorItem.folder(BookmarkRoots.MobileFolderGUID, modified: now, hasDupe: false, parentID: BookmarkRoots.RootGUID, parentName: "", title: "Mobile Bookmarks", description: "", children: ["emptyempty01", "emptyempty02", "emptyempty03"]),
+            BookmarkMirrorItem.folder("emptyempty01", modified: now, hasDupe: true, parentID: BookmarkRoots.MobileFolderGUID, parentName: "Mobile Bookmarks", title: "Empty", description: "", children: []),
+            BookmarkMirrorItem.folder("emptyempty02", modified: now, hasDupe: true, parentID: BookmarkRoots.MobileFolderGUID, parentName: "Mobile Bookmarks", title: "Empty", description: "", children: []),
+            BookmarkMirrorItem.folder("emptyempty03", modified: now, hasDupe: true, parentID: BookmarkRoots.MobileFolderGUID, parentName: "Mobile Bookmarks", title: "Empty", description: "", children: []),
+        ]
+
+        bookmarks.buffer.applyRecords(records).succeeded()
+
+        bookmarks.buffer.queryReturnsInt("SELECT COUNT(*) FROM \(TableBookmarksBuffer)", int: 4)
+        bookmarks.buffer.queryReturnsInt("SELECT COUNT(*) FROM \(TableBookmarksBufferStructure)", int: 3)
+
+        // Add one matching empty folder locally.
+        // Add one by GUID, too. This is the most complex possible case.
+
+        bookmarks.local.db.run("INSERT INTO \(TableBookmarksLocal) (guid, type, title, parentid, parentName, sync_status) VALUES ('emptyempty02', \(BookmarkNodeType.Folder.rawValue), 'Empty', '\(BookmarkRoots.MobileFolderGUID)', 'Mobile Bookmarks', \(SyncStatus.Changed.rawValue))").succeeded()
+        bookmarks.local.db.run("INSERT INTO \(TableBookmarksLocal) (guid, type, title, parentid, parentName, sync_status) VALUES ('emptyemptyL0', \(BookmarkNodeType.Folder.rawValue), 'Empty', '\(BookmarkRoots.MobileFolderGUID)', 'Mobile Bookmarks', \(SyncStatus.New.rawValue))").succeeded()
+        bookmarks.local.db.run("INSERT INTO \(TableBookmarksLocalStructure) (parent, child, idx) VALUES ('\(BookmarkRoots.MobileFolderGUID)', 'emptyempty02', 0)").succeeded()
+        bookmarks.local.db.run("INSERT INTO \(TableBookmarksLocalStructure) (parent, child, idx) VALUES ('\(BookmarkRoots.MobileFolderGUID)', 'emptyemptyL0', 1)").succeeded()
+
+        let storer = doMerge(bookmarks)
+
+        guard let mirror = bookmarks.treeForMirror().value.successValue else {
+            XCTFail("Couldn't get mirror!")
+            return
+        }
+
+        // After merge, the buffer and local are empty.
+        let edgesAfter = bookmarks.treesForEdges().value.successValue!
+        XCTAssertTrue(edgesAfter.local.isEmpty)
+        XCTAssertTrue(edgesAfter.buffer.isEmpty)
+
+        // All of the incoming records exist.
+        XCTAssertTrue(mirror.subtrees[0].recordGUID == BookmarkRoots.RootGUID)
+        XCTAssertNotNil(mirror.find("emptyempty01"))
+        XCTAssertNotNil(mirror.find("emptyempty02"))
+        XCTAssertNotNil(mirror.find("emptyempty03"))
+
+        // The local record that was smushed is not present…
+        XCTAssertNil(mirror.find("emptyemptyL0"))
+
+        // … and even though it was marked New, we tried to delete it, just in case.
+        XCTAssertTrue(storer.added.isEmpty)
+        XCTAssertTrue(storer.deletions.contains("emptyemptyL0"))
+
+        guard let mobile = mirror.find(BookmarkRoots.MobileFolderGUID) else {
+            XCTFail("No mobile folder in mirror.")
+            return
+        }
+
+        if case let .Folder(_, children) = mobile {
+            // This order isn't strictly specified, but try to preserve the remote order if we can.
+            XCTAssertEqual(children.map { $0.recordGUID }, ["emptyempty01", "emptyempty02", "emptyempty03"])
+        } else {
+            XCTFail("Mobile isn't a folder.")
+        }
     }
 }
